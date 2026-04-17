@@ -1,49 +1,64 @@
 """
-app.py — FastAPI backend for HyperNews.
-Loads .env, boots from disk (FAISS index + KG + bandit), exposes REST API.
+FastAPI backend for HyperNews.
+Loads persisted data, serves recommendations, and records feedback.
 """
-import sys, os
 
-# Fix tokenizer deadlock on Mac when running inside Uvicorn
+import os
+import sys
+from typing import Dict, Iterable, Optional
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# ── Path setup ────────────────────────────────────────────────────────────────
 _BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
 
-# ── Load .env ─────────────────────────────────────────────────────────────────
 from dotenv import load_dotenv
+
 load_dotenv(os.path.join(_BACKEND_DIR, "..", ".env"))
 
-# ── Imports ───────────────────────────────────────────────────────────────────
 import faiss
 import numpy as np
 import pandas as pd
-from typing import Optional, Dict
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 
-from user_profile import UserProfile, get_time_of_day, update_user_session, load_user_session, compute_context_score
 from bandit import LinUCBBandit
-from ranker import rank_articles, cold_start_recommendations, build_context_vector
-from rag_pipeline import generate_personalized_summary, retrieve_articles
-from graph import build_knowledge_graph, get_related_articles, get_graph_stats
-from db import init_db, save_user, load_user
+from db import delete_user, init_db, load_user, save_user
+from graph import build_knowledge_graph, get_graph_stats
+from mind_data import parse_entity_list
+from rag_pipeline import build_faiss_index, generate_personalized_summary, retrieve_articles
+from ranker import build_candidate_pool, build_context_vector, cold_start_recommendations, rank_articles
+from user_profile import (
+    UserProfile,
+    clear_user_session,
+    get_time_of_day,
+    load_user_session,
+    update_user_session,
+)
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
-_BASE       = os.path.join(_BACKEND_DIR, "..")
-DATA_DIR    = os.path.join(_BASE, "data")
-PARQUET     = os.path.join(DATA_DIR, "articles.parquet")      # full MIND dataset
-EMB_FILE    = os.path.join(DATA_DIR, "article_embeddings.npy") # 65 k × 384
-FAISS_FILE  = os.path.join(DATA_DIR, "faiss_mind.index")       # pre-built FAISS
+_BASE = os.path.join(_BACKEND_DIR, "..")
+DATA_DIR = os.path.join(_BASE, "data")
+GRAPH_DIR = os.path.join(_BASE, "graph")
+DEFAULT_PARQUET = os.path.join(DATA_DIR, "articles.parquet")
+DEFAULT_FAISS = os.path.join(DATA_DIR, "faiss_mind.index")
+PARQUET_FILES = [
+    DEFAULT_PARQUET,
+    os.path.join(DATA_DIR, "news_processed.parquet"),
+]
+FAISS_FILES = [
+    DEFAULT_FAISS,
+    os.path.join(DATA_DIR, "news_faiss.index"),
+]
+EMB_FILE = os.path.join(DATA_DIR, "article_embeddings.npy")
 BANDIT_FILE = os.path.join(_BASE, "models", "bandit_model.pkl")
+GRAPH_ENABLED = os.getenv("HYPERNEWS_ENABLE_GRAPH", "1").strip().lower() not in {"0", "false", "no"}
+GRAPH_ARTICLE_LIMIT = int(os.getenv("HYPERNEWS_GRAPH_ARTICLE_LIMIT", "0") or 0)
+STARTUP_MAX_ARTICLES = int(os.getenv("HYPERNEWS_MAX_ARTICLES", "0") or 0)
 
-# ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="HyperNews Recommendation API", version="2.0.0")
+app = FastAPI(title="HyperNews Recommendation API", version="2.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -52,205 +67,409 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Global state ──────────────────────────────────────────────────────────────
 USERS: Dict[str, UserProfile] = {}
-BANDIT: Optional[LinUCBBandit]  = None
-DF:            pd.DataFrame       = pd.DataFrame()
-EMBEDDINGS:    np.ndarray         = np.array([])
-FAISS_INDEX:   Optional[object]   = None
-KG_GRAPH:      Optional[object]   = None
-MODEL:         Optional[object]   = None
+BANDIT: Optional[LinUCBBandit] = None
+DF: pd.DataFrame = pd.DataFrame()
+EMBEDDINGS: np.ndarray = np.array([])
+FAISS_INDEX: Optional[object] = None
+KG_GRAPH: Optional[object] = None
+MODEL: Optional[object] = None
 
-# ── Pydantic models ───────────────────────────────────────────────────────────
+
 class RecommendRequest(BaseModel):
     user_id: str
     mood: str = "neutral"
     n: int = 10
     query: Optional[str] = None
 
+
 class FeedbackRequest(BaseModel):
     user_id: str
     article_id: str
-    action: str          # click | read_full | skip | save
-    dwell_time: float = 0.0   # seconds spent on article
+    action: str
+    dwell_time: float = 0.0
 
-# ── Serialization helper ─────────────────────────────────────────────────────
+
 _SAFE_COLS = {"news_id", "category", "subcategory", "title", "abstract", "url", "popularity", "score", "source"}
 
-def _to_python(v):
-    """Convert any numpy / pandas scalar to a native Python type."""
-    if v is None:
+
+def _to_python(value):
+    if value is None:
         return None
-    # numpy scalars expose item()
-    if hasattr(v, "item"):
-        return v.item()
-    # pandas Timestamp / datetime
-    if hasattr(v, "isoformat"):
-        return v.isoformat()
-    # NaN float
-    if isinstance(v, float) and v != v:
+    if hasattr(value, "item"):
+        return value.item()
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    if isinstance(value, float) and value != value:
         return None
-    return v
+    return value
+
 
 def sanitize_article(article: dict) -> dict:
-    """Keep only JSON-safe scalar columns and convert all values to native Python types."""
-    out = {}
-    for k, v in article.items():
-        if k not in _SAFE_COLS:
+    sanitized = {}
+    for key, value in article.items():
+        if key not in _SAFE_COLS:
             continue
-        if isinstance(v, (list, dict)):
+        if isinstance(value, (list, dict)):
             continue
-        out[k] = _to_python(v)
-    return out
+        sanitized[key] = _to_python(value)
+    return sanitized
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+def _resolve_existing_path(candidates: Iterable[str]) -> Optional[str]:
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _ensure_article_frame(df: pd.DataFrame) -> pd.DataFrame:
+    prepared = df.copy().reset_index(drop=True)
+    if "subcategory" not in prepared.columns:
+        prepared["subcategory"] = ""
+    for column in ("entities", "title_entities", "abstract_entities"):
+        if column in prepared.columns:
+            prepared[column] = prepared[column].apply(parse_entity_list)
+    for column in ("entity_ids", "entity_labels"):
+        if column in prepared.columns:
+            prepared[column] = prepared[column].apply(
+                lambda value: value if isinstance(value, list) else ([] if value is None else [value] if isinstance(value, str) and value.strip() else [])
+            )
+    if "text" not in prepared.columns:
+        title = prepared["title"].fillna("").astype(str) if "title" in prepared.columns else ""
+        abstract = prepared["abstract"].fillna("").astype(str) if "abstract" in prepared.columns else ""
+        prepared["text"] = title + ". " + abstract
+    return prepared
+
+
+def _normalize_embedding_matrix(embeddings: np.ndarray) -> np.ndarray:
+    arr = np.asarray(embeddings, dtype=np.float32)
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return arr / norms
+
+
+def _redis_status():
+    from user_profile import _REDIS_OK
+
+    return _REDIS_OK
+
+
+def _graph_frame(df: pd.DataFrame) -> pd.DataFrame:
+    if not GRAPH_ARTICLE_LIMIT or len(df) <= GRAPH_ARTICLE_LIMIT:
+        return df
+    if "popularity" in df.columns:
+        return df.sort_values("popularity", ascending=False).head(GRAPH_ARTICLE_LIMIT).reset_index(drop=True)
+    return df.head(GRAPH_ARTICLE_LIMIT).reset_index(drop=True)
+
+
+def _graph_cache_path_for_frame(graph_df: pd.DataFrame) -> str | None:
+    if not STARTUP_MAX_ARTICLES and not GRAPH_ARTICLE_LIMIT:
+        return None
+    os.makedirs(GRAPH_DIR, exist_ok=True)
+    return os.path.join(GRAPH_DIR, f"knowledge_graph.startup_{len(graph_df)}.pkl")
+
+
+def _balanced_startup_indices(df: pd.DataFrame, limit: int) -> np.ndarray:
+    if limit <= 0 or len(df) <= limit:
+        return df.index.to_numpy()
+
+    if "category" not in df.columns:
+        return df.head(limit).index.to_numpy()
+
+    working = df.copy()
+    if "popularity" in working.columns:
+        working = working.sort_values("popularity", ascending=False)
+
+    grouped: dict[str, list[int]] = {}
+    category_priority: list[tuple[str, float]] = []
+    for category, group in working.groupby(working["category"].fillna("").astype(str).str.lower(), sort=False):
+        rows = list(group.index)
+        if not rows:
+            continue
+        grouped[category] = rows
+        top_popularity = float(group["popularity"].iloc[0]) if "popularity" in group.columns else 0.0
+        category_priority.append((category, top_popularity))
+
+    ordered_categories = [category for category, _ in sorted(category_priority, key=lambda item: item[1], reverse=True)]
+    if not ordered_categories:
+        return working.head(limit).index.to_numpy()
+
+    selected: list[int] = []
+    cursors = {category: 0 for category in ordered_categories}
+
+    while len(selected) < limit:
+        progress = False
+        for category in ordered_categories:
+            rows = grouped[category]
+            cursor = cursors[category]
+            if cursor >= len(rows):
+                continue
+            selected.append(rows[cursor])
+            cursors[category] += 1
+            progress = True
+            if len(selected) >= limit:
+                break
+        if not progress:
+            break
+
+    return np.asarray(selected, dtype=np.int64)
+
+
+def _limit_loaded_assets(df: pd.DataFrame, embeddings: np.ndarray) -> tuple[pd.DataFrame, np.ndarray]:
+    if not STARTUP_MAX_ARTICLES or len(df) <= STARTUP_MAX_ARTICLES:
+        return df.reset_index(drop=True), embeddings
+
+    selected_idx = _balanced_startup_indices(df, STARTUP_MAX_ARTICLES)
+
+    limited_df = df.loc[selected_idx].reset_index(drop=True)
+    limited_embeddings = np.asarray(embeddings[selected_idx], dtype=np.float32)
+    category_mix = (
+        limited_df["category"].fillna("").astype(str).str.lower().value_counts().head(6).to_dict()
+        if "category" in limited_df.columns
+        else {}
+    )
+    print(
+        f"Trimmed startup assets to {len(limited_df):,} diverse articles via HYPERNEWS_MAX_ARTICLES. "
+        f"Top categories: {category_mix}"
+    )
+    return limited_df, limited_embeddings
+
+
 def get_or_create_user(user_id: str) -> UserProfile:
     if user_id not in USERS:
-        # Try loading from SQLite first
         stored = load_user(user_id)
         if stored:
             USERS[user_id] = UserProfile(
-                user_id         = user_id,
-                interests       = stored["interests"],
-                reading_history = stored["reading_history"],
+                user_id=user_id,
+                interests=stored["interests"],
+                reading_history=stored["reading_history"],
             )
         else:
             USERS[user_id] = UserProfile(user_id=user_id)
-        # Merge short-term session from Redis / fallback
+
         session = load_user_session(user_id)
         if session:
-            USERS[user_id].recent_clicks   = session.get("recent_clicks", [])
-            USERS[user_id].session_topics  = session.get("session_topics", [])
-            USERS[user_id].mood            = session.get("mood", "neutral")
+            USERS[user_id].recent_clicks = session.get("recent_clicks", [])
+            USERS[user_id].recent_skips = session.get("recent_skips", [])
+            USERS[user_id].session_topics = session.get("session_topics", [])
+            USERS[user_id].mood = session.get("mood", "neutral")
+
     return USERS[user_id]
 
-# ── Startup ───────────────────────────────────────────────────────────────────
+
 @app.on_event("startup")
 async def startup_event():
-    global DF, EMBEDDINGS, FAISS_INDEX, KG_GRAPH, MODEL, BANDIT
+    global BANDIT, DF, EMBEDDINGS, FAISS_INDEX, KG_GRAPH, MODEL
 
     init_db()
     os.makedirs(os.path.join(_BASE, "models"), exist_ok=True)
+    os.makedirs(DATA_DIR, exist_ok=True)
 
-    if os.path.exists(PARQUET) and os.path.exists(EMB_FILE):
-        DF         = pd.read_parquet(PARQUET)
-        EMBEDDINGS = np.load(EMB_FILE).astype("float32")
+    parquet_path = _resolve_existing_path(PARQUET_FILES)
+    faiss_path = _resolve_existing_path(FAISS_FILES)
 
-        # Load the pre-built MIND FAISS index directly (already normalized)
-        if os.path.exists(FAISS_FILE):
-            FAISS_INDEX = faiss.read_index(FAISS_FILE)
-            print(f"📂 Loaded FAISS index ({FAISS_INDEX.ntotal} vectors)")
+    if not parquet_path or not os.path.exists(EMB_FILE):
+        print(
+            "Data files not found. Expected one of:\n"
+            f"  parquet: {PARQUET_FILES}\n"
+            f"  embeddings: {EMB_FILE}\n"
+            f"  faiss: {FAISS_FILES}"
+        )
+        return
+
+    try:
+        DF = _ensure_article_frame(pd.read_parquet(parquet_path))
+        EMBEDDINGS = _normalize_embedding_matrix(np.load(EMB_FILE).astype("float32"))
+        if len(DF) != len(EMBEDDINGS):
+            raise ValueError(
+                f"Dataset and embedding count mismatch: {len(DF)} rows vs {len(EMBEDDINGS)} vectors"
+            )
+        DF, EMBEDDINGS = _limit_loaded_assets(DF, EMBEDDINGS)
+
+        if faiss_path:
+            FAISS_INDEX = faiss.read_index(faiss_path)
+            if FAISS_INDEX.ntotal != len(DF):
+                print(
+                    f"FAISS size mismatch for {os.path.basename(faiss_path)} "
+                    f"({FAISS_INDEX.ntotal} vs {len(DF)}). Rebuilding index."
+                )
+                FAISS_INDEX = None
+            else:
+                print(f"Loaded FAISS index from {os.path.basename(faiss_path)} ({FAISS_INDEX.ntotal} vectors)")
+
+        if FAISS_INDEX is None:
+            FAISS_INDEX = build_faiss_index(EMBEDDINGS)
+            if STARTUP_MAX_ARTICLES:
+                print(f"Built in-memory FAISS index ({FAISS_INDEX.ntotal} vectors) for capped startup mode")
+            else:
+                faiss.write_index(FAISS_INDEX, DEFAULT_FAISS)
+                print(f"Built and saved FAISS index ({FAISS_INDEX.ntotal} vectors)")
+
+        BANDIT = LinUCBBandit.load_or_create(
+            BANDIT_FILE,
+            context_dim=EMBEDDINGS.shape[1] + 3,
+        )
+        if GRAPH_ENABLED:
+            graph_df = _graph_frame(DF)
+            KG_GRAPH = build_knowledge_graph(
+                graph_df,
+                cache_path=_graph_cache_path_for_frame(graph_df),
+            )
         else:
-            # Fallback: build from embeddings if index is missing
-            print("⚠️  faiss_mind.index not found — building from embeddings...")
-            dimension   = EMBEDDINGS.shape[1]
-            FAISS_INDEX = faiss.IndexFlatIP(dimension)
-            emb_copy    = EMBEDDINGS.copy()
-            faiss.normalize_L2(emb_copy)
-            FAISS_INDEX.add(emb_copy)
-            faiss.write_index(FAISS_INDEX, FAISS_FILE)
-            print(f"✅ Built and saved FAISS index ({FAISS_INDEX.ntotal} vectors)")
+            KG_GRAPH = None
+        MODEL = None
 
-        BANDIT   = LinUCBBandit.load_or_create(BANDIT_FILE, context_dim=387)
-        KG_GRAPH = build_knowledge_graph(DF)
+        print(
+            f"Backend ready: {len(DF):,} articles | "
+            f"KG nodes: {KG_GRAPH.number_of_nodes() if KG_GRAPH else 0} | "
+            f"Embeddings: {EMBEDDINGS.shape}"
+        )
+    except Exception as exc:
+        print(f"Startup failed while loading recommendation assets: {exc}")
+        DF = pd.DataFrame()
+        EMBEDDINGS = np.array([])
+        FAISS_INDEX = None
+        KG_GRAPH = None
+        BANDIT = None
+        MODEL = None
 
-        print(f"✅ Backend ready: {len(DF):,} articles | KG: {KG_GRAPH.number_of_nodes()} nodes | Embeddings: {EMBEDDINGS.shape}")
-    else:
-        print(f"⚠️  Data files not found. Expected:\n   {PARQUET}\n   {EMB_FILE}\n   {FAISS_FILE}")
 
-# ── Shutdown: persist bandit ──────────────────────────────────────────────────
 @app.on_event("shutdown")
 async def shutdown_event():
     if BANDIT:
         BANDIT.save(BANDIT_FILE)
-        print("💾 Bandit state saved to disk.")
+        print("Bandit state saved to disk.")
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+
 @app.get("/health")
 async def health():
     return {
-        "status":          "ok",
+        "status": "ok",
         "articles_loaded": len(DF),
-        "kg_nodes":        KG_GRAPH.number_of_nodes() if KG_GRAPH else 0,
-        "users_active":    len(USERS),
-        "groq_enabled":    bool(os.getenv("GROQ_API_KEY")),
-        "redis_enabled":   _redis_status(),
+        "kg_nodes": KG_GRAPH.number_of_nodes() if KG_GRAPH else 0,
+        "users_active": len(USERS),
+        "groq_enabled": bool(os.getenv("GROQ_API_KEY")),
+        "redis_enabled": _redis_status(),
+        "graph_enabled": GRAPH_ENABLED,
+        "graph_article_limit": GRAPH_ARTICLE_LIMIT,
+        "startup_max_articles": STARTUP_MAX_ARTICLES,
     }
 
-def _redis_status():
-    from user_profile import _REDIS_OK
-    return _REDIS_OK
 
 @app.get("/articles")
 async def get_articles(limit: int = 20):
     if len(DF) == 0:
         return {"articles": []}
     records = DF.sample(min(limit, len(DF))).to_dict("records")
-    return {"articles": [sanitize_article(a) for a in records]}
+    return {"articles": [sanitize_article(article) for article in records]}
+
 
 @app.get("/graph")
 async def graph_info():
     if KG_GRAPH is None:
-        return {"error": "Graph not loaded"}
+        return {
+            "error": "Graph not loaded",
+            "graph_enabled": GRAPH_ENABLED,
+            "graph_article_limit": GRAPH_ARTICLE_LIMIT,
+            "startup_max_articles": STARTUP_MAX_ARTICLES,
+        }
     return get_graph_stats(KG_GRAPH)
+
 
 @app.get("/profile/{user_id}")
 async def get_profile(user_id: str):
     user = get_or_create_user(user_id)
     return {
-        "user_id":        user.user_id,
-        "mood":           user.mood,
-        "time_of_day":    user.time_of_day,
-        "interests":      user.interests,
-        "articles_read":  len(user.reading_history),
-        "recent_clicks":  user.recent_clicks[-5:],
+        "user_id": user.user_id,
+        "mood": user.mood,
+        "time_of_day": user.time_of_day,
+        "interests": user.interests,
+        "articles_read": len(user.reading_history),
+        "recent_clicks": user.recent_clicks[-5:],
+        "recent_skips": user.recent_skips[-5:],
         "session_topics": user.session_topics[-10:],
     }
+
 
 @app.post("/recommend")
 async def recommend(req: RecommendRequest):
     global MODEL
+
     if len(DF) == 0:
         return {"error": "Data not loaded. Run generate_data.py first."}
 
-    user            = get_or_create_user(req.user_id)
-    user.mood       = req.mood
+    user = get_or_create_user(req.user_id)
+    user.mood = req.mood
     user.time_of_day = get_time_of_day()
 
-    if not user.reading_history and not req.query:
+    if not user.reading_history and not user.recent_skips and not req.query:
         articles = cold_start_recommendations(user, DF, req.n)
-        mode     = "cold_start"
+        mode = "cold_start"
     elif req.query and FAISS_INDEX is not None:
         if MODEL is None:
-            # Lazy load the semantic model
             MODEL = SentenceTransformer("all-MiniLM-L6-v2")
-        raw      = retrieve_articles(req.query, FAISS_INDEX, DF, MODEL, top_k=20)
+
+        raw = retrieve_articles(
+            req.query,
+            FAISS_INDEX,
+            DF,
+            MODEL,
+            top_k=max(req.n * 5, 24),
+        )
+        if len(raw) < req.n:
+            fallback_pool = build_candidate_pool(
+                user,
+                DF,
+                EMBEDDINGS,
+                FAISS_INDEX,
+                graph=KG_GRAPH,
+                max_candidates=max(req.n * 5, 24),
+            )
+            seen_ids = {article["news_id"] for article in raw}
+            raw.extend([article for article in fallback_pool if article["news_id"] not in seen_ids])
+
         articles = rank_articles(user, raw, EMBEDDINGS, BANDIT, DF, KG_GRAPH)[:req.n]
-        mode     = "rag"
+        mode = "rag"
     else:
-        candidates = DF.sample(min(100, len(DF))).to_dict("records")
-        articles   = rank_articles(user, candidates, EMBEDDINGS, BANDIT, DF, KG_GRAPH)[:req.n]
-        mode       = "rl"
+        candidates = build_candidate_pool(
+            user,
+            DF,
+            EMBEDDINGS,
+            FAISS_INDEX,
+            graph=KG_GRAPH,
+            max_candidates=min(max(req.n * 25, 120), len(DF)),
+        )
+        articles = rank_articles(user, candidates, EMBEDDINGS, BANDIT, DF, KG_GRAPH)[:req.n]
+        if not articles:
+            articles = cold_start_recommendations(user, DF, req.n)
+        mode = "rl"
 
     explanation = generate_personalized_summary(
-        {"mood": user.mood, "time_of_day": user.time_of_day},
+        {
+            "mood": user.mood,
+            "time_of_day": user.time_of_day,
+            "mode": mode,
+            "query": req.query,
+            "recent_topics": user.session_topics[-5:],
+        },
         articles,
     )
 
     update_user_session(user)
 
     return {
-        "articles":    [sanitize_article(a) for a in articles],
+        "articles": [sanitize_article(article) for article in articles],
         "explanation": explanation,
-        "user_id":     req.user_id,
-        "mode":        mode,
+        "user_id": req.user_id,
+        "mode": mode,
     }
+
 
 @app.post("/feedback")
 async def feedback(req: FeedbackRequest):
     reward_map = {"click": 0.5, "read_full": 1.0, "skip": -0.2, "save": 2.0}
-    reward     = reward_map.get(req.action, 0)
+    reward = reward_map.get(req.action, 0.0)
 
     user = get_or_create_user(req.user_id)
 
@@ -258,31 +477,36 @@ async def feedback(req: FeedbackRequest):
         match = DF[DF["news_id"] == req.article_id]
         if len(match) == 0:
             return {"status": "article_not_found"}
-        idx  = match.index[0]
-        emb  = EMBEDDINGS[idx]
-        ctx  = build_context_vector(user, emb)
-        if BANDIT:
-            BANDIT.update(req.article_id, ctx, reward)
 
+        idx = int(match.index[0])
+        article_embedding = EMBEDDINGS[idx]
+        context_vector = build_context_vector(user, article_embedding)
+        if BANDIT:
+            BANDIT.update(req.article_id, context_vector, reward)
+
+        category = match.iloc[0]["category"]
         if req.action in ("click", "read_full", "save"):
             if req.article_id not in user.reading_history:
                 user.reading_history.append(req.article_id)
             user.recent_clicks.append(req.article_id)
-            cat = match.iloc[0]["category"]
-            user.interests[cat] = user.interests.get(cat, 0.0) + reward
-            user.session_topics.append(cat)
+            user.recent_skips = [news_id for news_id in user.recent_skips if news_id != req.article_id]
+            user.interests[category] = user.interests.get(category, 0.0) + reward
+            user.session_topics.append(category)
+        elif req.action == "skip":
+            user.recent_skips.append(req.article_id)
+            user.recent_skips = user.recent_skips[-30:]
 
-        # Persist to SQLite + Redis
         save_user(user.user_id, user.interests, user.reading_history, len(user.reading_history))
         update_user_session(user)
-
-    except Exception as e:
-        print(f"Error in /feedback: {e}")
+    except Exception as exc:
+        print(f"Error in /feedback: {exc}")
 
     return {"status": "updated", "reward": reward}
 
+
 @app.post("/reset/{user_id}")
 async def reset_user(user_id: str):
-    if user_id in USERS:
-        del USERS[user_id]
+    USERS.pop(user_id, None)
+    clear_user_session(user_id)
+    delete_user(user_id)
     return {"status": "reset", "user_id": user_id}

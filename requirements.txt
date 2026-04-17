@@ -4,7 +4,7 @@ faiss-cpu
 sentence-transformers
 langchain
 langchain-groq
-spacy<3.8.0
+spacy<3.8.0; python_version < "3.13"
 networkx
 redis
 fastapi

@@ -59,12 +59,18 @@ def generate_synthetic_news(num_articles: int = 150):
     # Save
     data_dir = os.path.join(os.path.dirname(__file__), "..", "data")
     os.makedirs(data_dir, exist_ok=True)
+    df.to_parquet(os.path.join(data_dir, "articles.parquet"))
     df.to_parquet(os.path.join(data_dir, "news_processed.parquet"))
     
     # Generate embeddings
     print("Generating embeddings...")
     model = SentenceTransformer("all-MiniLM-L6-v2")
-    embeddings = model.encode(df["text"].tolist(), batch_size=32, show_progress_bar=True)
+    embeddings = model.encode(
+        df["text"].tolist(),
+        batch_size=32,
+        show_progress_bar=True,
+        normalize_embeddings=True,
+    )
     np.save(os.path.join(data_dir, "article_embeddings.npy"), embeddings)
     
     print(f"Successfully generated {num_articles} synthetic articles and embeddings.")

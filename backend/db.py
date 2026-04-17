@@ -68,3 +68,14 @@ def load_user(user_id: str) -> Optional[dict]:
         }
     finally:
         db.close()
+
+
+def delete_user(user_id: str):
+    db = SessionLocal()
+    try:
+        record = db.query(UserRecord).filter(UserRecord.user_id == user_id).first()
+        if record:
+            db.delete(record)
+            db.commit()
+    finally:
+        db.close()

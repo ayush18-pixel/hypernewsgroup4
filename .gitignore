@@ -24,7 +24,7 @@ wheels/
 
 # Data & Models
 data/
-graph/knowledge_graph.pkl
+graph/*.pkl
 models/*.pkl
 
 # Environment & Secrets
