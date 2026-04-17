@@ -26,16 +26,27 @@ from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 
 from bandit import LinUCBBandit
-from db import delete_user, init_db, load_user, save_user
+from db import delete_user, init_db, load_user, save_user, save_reading_vector
 from graph import build_knowledge_graph, get_graph_stats
 from mind_data import parse_entity_list
 from rag_pipeline import build_faiss_index, generate_personalized_summary, retrieve_articles
-from ranker import build_candidate_pool, build_context_vector, cold_start_recommendations, rank_articles
+from ranker import (
+    _apply_interest_ema_decay,
+    _build_news_id_to_idx,
+    _graph_bonus_map,
+    _normalize_key,
+    build_candidate_pool,
+    build_context_vector,
+    cold_start_recommendations,
+    get_kg_related_ids,
+    rank_articles,
+)
 from user_profile import (
     UserProfile,
     clear_user_session,
     get_time_of_day,
     load_user_session,
+    push_recent_history,
     update_user_session,
 )
 
@@ -58,7 +69,27 @@ GRAPH_ENABLED = os.getenv("HYPERNEWS_ENABLE_GRAPH", "1").strip().lower() not in 
 GRAPH_ARTICLE_LIMIT = int(os.getenv("HYPERNEWS_GRAPH_ARTICLE_LIMIT", "0") or 0)
 STARTUP_MAX_ARTICLES = int(os.getenv("HYPERNEWS_MAX_ARTICLES", "0") or 0)
 
-app = FastAPI(title="HyperNews Recommendation API", version="2.1.0")
+# ── Exploration / feedback policy ─────────────────────────────────────────────
+# Stay in semi-cold-start until this many confirmed positive interactions.
+# Must match _INTEREST_WARMUP_INTERACTIONS in ranker.py (both = 5).
+_SEMI_COLD_START_THRESHOLD = 5
+
+# Interest nudge: fraction of reward added to category weight per event.
+# click: 0.5 * 0.25 = 0.125; save: 2.0 * 0.25 = 0.5. Prevents instant lock-in.
+_INTEREST_NUDGE_FACTOR = 0.25
+
+# Skip: relative decay + fixed penalty on the category weight.
+_SKIP_DECAY_FACTOR = 0.15
+_SKIP_FIXED_PENALTY = 0.10
+
+# Reward map used for bandit training (not for interest accumulation).
+_REWARD_MAP = {"click": 0.5, "read_full": 1.0, "skip": -0.3, "save": 2.0}
+
+# Decay applied to sibling articles in the same category on positive feedback.
+_CATEGORY_PROPAGATION_DECAY = 0.3
+# ─────────────────────────────────────────────────────────────────────────────
+
+app = FastAPI(title="HyperNews Recommendation API", version="2.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -151,7 +182,6 @@ def _normalize_embedding_matrix(embeddings: np.ndarray) -> np.ndarray:
 
 def _redis_status():
     from user_profile import _REDIS_OK
-
     return _REDIS_OK
 
 
@@ -250,10 +280,12 @@ def get_or_create_user(user_id: str) -> UserProfile:
 
         session = load_user_session(user_id)
         if session:
-            USERS[user_id].recent_clicks = session.get("recent_clicks", [])
-            USERS[user_id].recent_skips = session.get("recent_skips", [])
+            USERS[user_id].recent_clicks  = session.get("recent_clicks", [])
+            USERS[user_id].recent_skips   = session.get("recent_skips", [])
             USERS[user_id].session_topics = session.get("session_topics", [])
-            USERS[user_id].mood = session.get("mood", "neutral")
+            USERS[user_id].mood           = session.get("mood", "neutral")
+            USERS[user_id].total_positive_interactions = session.get("total_positive_interactions", 0)
+            USERS[user_id].interest_update_count       = session.get("interest_update_count", 0)
 
     return USERS[user_id]
 
@@ -292,7 +324,7 @@ async def startup_event():
             if FAISS_INDEX.ntotal != len(DF):
                 print(
                     f"FAISS size mismatch for {os.path.basename(faiss_path)} "
-                    f"({FAISS_INDEX.ntotal} vs {len(DF)}). Rebuilding index."
+                    f"({FAISS_INDEX.ntotal} vs {len(DF)}). Rebuilding index (will use HNSW)."
                 )
                 FAISS_INDEX = None
             else:
@@ -301,15 +333,21 @@ async def startup_event():
         if FAISS_INDEX is None:
             FAISS_INDEX = build_faiss_index(EMBEDDINGS)
             if STARTUP_MAX_ARTICLES:
-                print(f"Built in-memory FAISS index ({FAISS_INDEX.ntotal} vectors) for capped startup mode")
+                print(f"Built in-memory HNSW index ({FAISS_INDEX.ntotal} vectors) for capped startup mode")
             else:
                 faiss.write_index(FAISS_INDEX, DEFAULT_FAISS)
-                print(f"Built and saved FAISS index ({FAISS_INDEX.ntotal} vectors)")
+                print(f"Built and saved HNSW index ({FAISS_INDEX.ntotal} vectors)")
 
+        # context_dim = 384 embedding + 7 context scalars = 391
+        # The 7th scalar is kg_score (knowledge graph affinity), so the bandit
+        # learns jointly from RL rewards and graph structure.
+        # Note: any existing bandit_model.pkl at a different dim will be recreated fresh.
         BANDIT = LinUCBBandit.load_or_create(
             BANDIT_FILE,
-            context_dim=EMBEDDINGS.shape[1] + 3,
+            context_dim=EMBEDDINGS.shape[1] + 7,
+            epsilon=0.05,
         )
+
         if GRAPH_ENABLED:
             graph_df = _graph_frame(DF)
             KG_GRAPH = build_knowledge_graph(
@@ -320,10 +358,23 @@ async def startup_event():
             KG_GRAPH = None
         MODEL = None
 
+        # Load Transformer encoder if saved weights exist
+        try:
+            from transformer_encoder import load_encoder, _MODEL_SAVE_PATH as _ENC_PATH
+            enc_path = os.path.join(_BASE, _ENC_PATH)
+            if os.path.exists(enc_path):
+                load_encoder(enc_path)
+                print(f"Transformer encoder loaded from {enc_path}")
+            else:
+                print("Transformer encoder: no saved weights found, using random init (improves over time)")
+        except ImportError:
+            pass
+
         print(
             f"Backend ready: {len(DF):,} articles | "
             f"KG nodes: {KG_GRAPH.number_of_nodes() if KG_GRAPH else 0} | "
-            f"Embeddings: {EMBEDDINGS.shape}"
+            f"Embeddings: {EMBEDDINGS.shape} | "
+            f"Bandit context_dim: {BANDIT.context_dim}"
         )
     except Exception as exc:
         print(f"Startup failed while loading recommendation assets: {exc}")
@@ -340,6 +391,12 @@ async def shutdown_event():
     if BANDIT:
         BANDIT.save(BANDIT_FILE)
         print("Bandit state saved to disk.")
+    try:
+        from transformer_encoder import save_encoder, _MODEL_SAVE_PATH as _ENC_PATH
+        save_encoder(os.path.join(_BASE, _ENC_PATH))
+        print("Transformer encoder saved.")
+    except ImportError:
+        pass
 
 
 @app.get("/health")
@@ -354,6 +411,7 @@ async def health():
         "graph_enabled": GRAPH_ENABLED,
         "graph_article_limit": GRAPH_ARTICLE_LIMIT,
         "startup_max_articles": STARTUP_MAX_ARTICLES,
+        "bandit_context_dim": BANDIT.context_dim if BANDIT else 0,
     }
 
 
@@ -389,6 +447,7 @@ async def get_profile(user_id: str):
         "recent_clicks": user.recent_clicks[-5:],
         "recent_skips": user.recent_skips[-5:],
         "session_topics": user.session_topics[-10:],
+        "total_positive_interactions": user.total_positive_interactions,
     }
 
 
@@ -403,8 +462,16 @@ async def recommend(req: RecommendRequest):
     user.mood = req.mood
     user.time_of_day = get_time_of_day()
 
-    if not user.reading_history and not user.recent_skips and not req.query:
+    n_positive = user.total_positive_interactions
+    use_cold_start = (
+        n_positive < _SEMI_COLD_START_THRESHOLD
+        and not user.recent_skips
+        and not req.query
+    )
+
+    if use_cold_start:
         articles = cold_start_recommendations(user, DF, req.n)
+        user._last_candidate_pool = []
         mode = "cold_start"
     elif req.query and FAISS_INDEX is not None:
         if MODEL is None:
@@ -429,7 +496,8 @@ async def recommend(req: RecommendRequest):
             seen_ids = {article["news_id"] for article in raw}
             raw.extend([article for article in fallback_pool if article["news_id"] not in seen_ids])
 
-        articles = rank_articles(user, raw, EMBEDDINGS, BANDIT, DF, KG_GRAPH)[:req.n]
+        user._last_candidate_pool = raw
+        articles = rank_articles(user, raw, EMBEDDINGS, BANDIT, DF, KG_GRAPH, n=req.n)
         mode = "rag"
     else:
         candidates = build_candidate_pool(
@@ -440,7 +508,8 @@ async def recommend(req: RecommendRequest):
             graph=KG_GRAPH,
             max_candidates=min(max(req.n * 25, 120), len(DF)),
         )
-        articles = rank_articles(user, candidates, EMBEDDINGS, BANDIT, DF, KG_GRAPH)[:req.n]
+        user._last_candidate_pool = candidates
+        articles = rank_articles(user, candidates, EMBEDDINGS, BANDIT, DF, KG_GRAPH, n=req.n)
         if not articles:
             articles = cold_start_recommendations(user, DF, req.n)
         mode = "rl"
@@ -468,8 +537,7 @@ async def recommend(req: RecommendRequest):
 
 @app.post("/feedback")
 async def feedback(req: FeedbackRequest):
-    reward_map = {"click": 0.5, "read_full": 1.0, "skip": -0.2, "save": 2.0}
-    reward = reward_map.get(req.action, 0.0)
+    reward = _REWARD_MAP.get(req.action, 0.0)
 
     user = get_or_create_user(req.user_id)
 
@@ -480,21 +548,95 @@ async def feedback(req: FeedbackRequest):
 
         idx = int(match.index[0])
         article_embedding = EMBEDDINGS[idx]
-        context_vector = build_context_vector(user, article_embedding)
+
+        # Build kg_score for this article so the context vector fed to the bandit
+        # includes graph affinity — RL and KG learn together.
+        news_id_to_idx_fb = _build_news_id_to_idx(DF)
+        graph_bonus_fb = _graph_bonus_map(user, KG_GRAPH)
+        article_kg_score = float(graph_bonus_fb.get(req.article_id, 0.0))
+
+        context_vector = build_context_vector(user, article_embedding, kg_score=article_kg_score)
+
         if BANDIT:
-            BANDIT.update(req.article_id, context_vector, reward)
+            # KG-augmented reward: if the article has strong graph affinity we reinforce
+            # that signal by slightly boosting the reward the bandit trains on.
+            # This teaches the bandit that "KG-connected + clicked" is especially good.
+            kg_reward_boost = 0.15 * article_kg_score if reward > 0 else 0.0
+            augmented_reward = float(np.clip(reward + kg_reward_boost, -1.0, 2.5))
+            BANDIT.update(req.article_id, context_vector, augmented_reward)
+
+            # Update category-level stats for all actions (incl. skip)
+            category_str = str(match.iloc[0]["category"])
+            BANDIT._update_category_stats(category_str, BANDIT._normalize_reward(augmented_reward))
+
+            # Propagate positive reward to category siblings from last pool
+            if reward > 0:
+                last_pool = getattr(user, "_last_candidate_pool", [])
+                sibling_ids = [
+                    str(art.get("news_id"))
+                    for art in last_pool
+                    if str(art.get("news_id")) != req.article_id
+                    and _normalize_key(str(art.get("category", ""))) == _normalize_key(category_str)
+                    and art.get("news_id")
+                ]
+                if sibling_ids:
+                    BANDIT.propagate_category_reward(
+                        category_str,
+                        sibling_ids,
+                        reward,
+                        decay=_CATEGORY_PROPAGATION_DECAY,
+                    )
+
+                # KG reward propagation: also update bandit stats for KG-linked articles.
+                # This is the key RL+KG joint learning: clicking article A tells the bandit
+                # that graph-neighbours of A are also likely to be interesting.
+                if KG_GRAPH is not None:
+                    kg_linked_ids = get_kg_related_ids(
+                        req.article_id, KG_GRAPH, news_id_to_idx_fb, limit=20
+                    )
+                    if kg_linked_ids:
+                        BANDIT.propagate_category_reward(
+                            category_str,
+                            kg_linked_ids,
+                            reward,
+                            decay=0.15,   # lighter decay than category siblings (0.3)
+                        )
 
         category = match.iloc[0]["category"]
+
         if req.action in ("click", "read_full", "save"):
             if req.article_id not in user.reading_history:
                 user.reading_history.append(req.article_id)
             user.recent_clicks.append(req.article_id)
-            user.recent_skips = [news_id for news_id in user.recent_skips if news_id != req.article_id]
-            user.interests[category] = user.interests.get(category, 0.0) + reward
+            user.recent_skips = [nid for nid in user.recent_skips if nid != req.article_id]
             user.session_topics.append(category)
+
+            # Soft nudge: fraction of reward only — prevents instant category lock-in
+            nudge = abs(reward) * _INTEREST_NUDGE_FACTOR
+            user.interests[category] = user.interests.get(category, 0.0) + nudge
+            user.total_positive_interactions += 1
+
+            # Push to Redis recent-history sorted set
+            push_recent_history(req.user_id, req.article_id)
+
+            # Persist embedding to long-term vector store (pgvector or SQLite blob)
+            try:
+                save_reading_vector(req.user_id, req.article_id, article_embedding, feedback_weight=nudge)
+            except Exception as vec_err:
+                print(f"Vector history write failed (non-fatal): {vec_err}")
+
         elif req.action == "skip":
             user.recent_skips.append(req.article_id)
             user.recent_skips = user.recent_skips[-30:]
+
+            # Relative decay + fixed penalty so repeated skips genuinely suppress the category
+            current = user.interests.get(category, 0.0)
+            if current > 0:
+                user.interests[category] = max(0.0, current * (1.0 - _SKIP_DECAY_FACTOR) - _SKIP_FIXED_PENALTY)
+
+        # EMA decay: all interest weights decay by 5% on every feedback event
+        _apply_interest_ema_decay(user)
+        user.interest_update_count += 1
 
         save_user(user.user_id, user.interests, user.reading_history, len(user.reading_history))
         update_user_session(user)

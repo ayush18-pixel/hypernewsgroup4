@@ -76,7 +76,7 @@ class NeuralContextualBandit:
 
     def __init__(
         self,
-        context_dim: int = 387,
+        context_dim: int = 391,
         alpha: float = 0.35,
         ensemble_size: int = 5,
         hidden_dims: tuple[int, ...] = (256, 128, 64),
@@ -86,6 +86,7 @@ class NeuralContextualBandit:
         train_steps_per_update: int = 3,
         replay_capacity: int = 8000,
         min_buffer_to_train: int = 32,
+        epsilon: float = 0.05,
         device: str = "cpu",
     ):
         self.context_dim = int(context_dim)
@@ -107,9 +108,12 @@ class NeuralContextualBandit:
             weight_decay=self.weight_decay,
         )
 
+        self.epsilon = float(epsilon)
+
         self.context_buffer: deque[np.ndarray] = deque(maxlen=self.replay_capacity)
         self.reward_buffer: deque[float] = deque(maxlen=self.replay_capacity)
         self.article_stats: dict[str, dict[str, float]] = {}
+        self.category_stats: dict[str, dict[str, float]] = {}
         self.total_updates = 0
 
     def _normalize_reward(self, reward: float) -> float:
@@ -133,6 +137,46 @@ class NeuralContextualBandit:
         new_count = count + 1.0
         stats["count"] = new_count
         stats["mean_reward"] = mean_reward + ((normalized_reward - mean_reward) / new_count)
+
+    def _update_category_stats(self, category: str, normalized_reward: float):
+        key = str(category).strip().lower()
+        if not key:
+            return
+        stats = self.category_stats.setdefault(key, {"count": 0.0, "mean_reward": 0.0})
+        count = float(stats["count"])
+        mean = float(stats["mean_reward"])
+        new_count = count + 1.0
+        stats["count"] = new_count
+        stats["mean_reward"] = mean + ((normalized_reward - mean) / new_count)
+
+    def _category_prior(self, category: str) -> tuple[float, float]:
+        key = str(category).strip().lower()
+        stats = self.category_stats.get(key)
+        if not stats:
+            return 0.0, 0.0
+        mean_reward = float(stats.get("mean_reward", 0.0))
+        count = float(stats.get("count", 0.0))
+        # Smaller coefficients than article-level (0.12, 0.05) — category signal is noisier
+        cat_prior_bonus = 0.08 * mean_reward
+        cat_explore_bonus = 0.03 / np.sqrt(max(count, 1.0))
+        return cat_prior_bonus, cat_explore_bonus
+
+    def propagate_category_reward(
+        self,
+        category: str,
+        sibling_article_ids: list,
+        reward: float,
+        decay: float = 0.3,
+    ):
+        """Apply a decayed reward to sibling articles in the same category.
+
+        Stat-only update — does NOT add to replay buffer or trigger training,
+        which would corrupt the buffer with phantom observations.
+        """
+        propagated = float(np.clip(reward * decay, 0.0, 1.0))
+        for article_id in sibling_article_ids:
+            self._update_article_stats(str(article_id), propagated)
+        self._update_category_stats(category, propagated)
 
     def _append_example(self, context: np.ndarray, normalized_reward: float):
         self.context_buffer.append(_as_float32(context))
@@ -193,11 +237,19 @@ class NeuralContextualBandit:
             probs = torch.sigmoid(logits).squeeze(0).cpu().numpy().astype(np.float32)
         return float(np.mean(probs)), float(np.std(probs))
 
-    def score(self, article_id: str, context: np.ndarray) -> float:
+    def score(self, article_id: str, context: np.ndarray, category: str = "") -> float:
         predicted_reward, uncertainty = self._predict_ensemble(context)
         prior_bonus, article_explore = self._article_prior(str(article_id))
-        score = predicted_reward + (self.alpha * uncertainty) + prior_bonus + article_explore
-        return float(np.clip(score, 0.0, 1.5))
+        cat_prior_bonus, cat_explore = self._category_prior(category)
+
+        if np.random.random() < self.epsilon:
+            # ε-Thompson Sampling: sample from N(mean, std) for exploration
+            base = float(np.clip(np.random.normal(predicted_reward, max(uncertainty, 1e-6)), 0.0, 1.0))
+        else:
+            # UCB exploitation (unchanged)
+            base = predicted_reward + (self.alpha * uncertainty)
+
+        return float(np.clip(base + prior_bonus + article_explore + cat_prior_bonus + cat_explore, 0.0, 1.5))
 
     def update(self, article_id: str, context: np.ndarray, reward: float):
         self.update_batch([article_id], [context], [reward])
@@ -225,7 +277,8 @@ class NeuralContextualBandit:
             article_id = article.get("news_id") or article.get("id")
             if not article_id:
                 continue
-            bandit_score = self.score(article_id, context)
+            category = str(article.get("category", ""))
+            bandit_score = self.score(article_id, context, category=category)
             scored.append({**article, "ucb_score": bandit_score})
         return sorted(scored, key=lambda item: item["ucb_score"], reverse=True)
 
@@ -256,6 +309,7 @@ class NeuralContextualBandit:
                 "train_steps_per_update": self.train_steps_per_update,
                 "replay_capacity": self.replay_capacity,
                 "min_buffer_to_train": self.min_buffer_to_train,
+                "epsilon": self.epsilon,
                 "device": "cpu",
             },
             "state_dict": self.model.state_dict(),
@@ -263,6 +317,7 @@ class NeuralContextualBandit:
             "contexts": contexts,
             "rewards": rewards,
             "article_stats": self.article_stats,
+            "category_stats": self.category_stats,
             "total_updates": self.total_updates,
         }
         torch.save(payload, path)
@@ -291,6 +346,14 @@ class NeuralContextualBandit:
             }
             for article_id, stats in payload.get("article_stats", {}).items()
         }
+        inst.category_stats = {
+            str(k): {
+                "count": float(v.get("count", 0.0)),
+                "mean_reward": float(v.get("mean_reward", 0.0)),
+            }
+            for k, v in payload.get("category_stats", {}).items()
+        }
+        inst.epsilon = float(payload.get("epsilon", 0.05))
         inst.total_updates = int(payload.get("total_updates", len(inst.reward_buffer)))
         return inst
 
@@ -304,6 +367,8 @@ class NeuralContextualBandit:
                     return cls(**kwargs)
                 if "alpha" in kwargs:
                     inst.alpha = float(kwargs["alpha"])
+                if "epsilon" in kwargs:
+                    inst.epsilon = float(kwargs["epsilon"])
                 return inst
             except Exception as exc:
                 print(f"Bandit state load failed for {path}: {exc}. Recreating bandit state.")

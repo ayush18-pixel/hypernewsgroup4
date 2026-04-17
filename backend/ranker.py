@@ -11,6 +11,15 @@ except ImportError:
     from mind_data import parse_entity_list
     from user_profile import compute_context_score
 
+# ── Diversity / exploration policy ────────────────────────────────────────────
+_DIVERSITY_MAX_FRACTION      = 0.35   # kept for reference (MMR replaces hard quota)
+_CATEGORY_LOCK_THRESHOLD     = 4      # confirmed reads before category earns dominance override in MMR
+_MMR_LAMBDA                  = 0.82   # relevance vs diversity tradeoff (λ close to 1 → more relevance)
+_INTEREST_WARMUP_INTERACTIONS = 5     # positive interactions before interest_score reaches full weight
+_INTEREST_DOMINANCE_THRESHOLD = 0.50  # concentration above which entropy penalty fires
+_INTEREST_EMA_ALPHA           = 0.05  # per-feedback EMA decay rate on all interest weights
+_CAT_BALANCE_MIN_INTERACTIONS = 3     # interactions before category-balanced FAISS kicks in
+
 
 def _l2_normalize(vector: np.ndarray) -> np.ndarray:
     arr = np.asarray(vector, dtype=np.float32)
@@ -42,6 +51,22 @@ def _extract_entity_keys(value) -> list[str]:
 
 
 def build_user_profile_vector(user, article_embeddings: np.ndarray, news_id_to_idx: dict) -> np.ndarray | None:
+    """Build a 384-dim user state vector.
+
+    Tries the Transformer encoder first (seq-aware CLS pooling).
+    Falls back to weighted mean of recent click embeddings if the encoder
+    is unavailable or has too few history items.
+    """
+    try:
+        from transformer_encoder import encode_user_history
+        history_ids = list(user.recent_clicks[-20:]) + list(user.reading_history[-20:])
+        vec = encode_user_history(history_ids, article_embeddings, news_id_to_idx)
+        if vec is not None:
+            return vec
+    except ImportError:
+        pass
+
+    # Fallback: weighted mean (recent clicks counted twice for recency bias)
     weighted_ids = list(user.recent_clicks[-8:]) + list(user.recent_clicks[-8:]) + list(user.reading_history[-16:])
     vectors = []
     for news_id in weighted_ids:
@@ -55,6 +80,12 @@ def build_user_profile_vector(user, article_embeddings: np.ndarray, news_id_to_i
 
 
 def _score_interest(user, category: str) -> float:
+    """Normalised interest score with entropy penalty and warm-up damp.
+
+    Bug 1 fix: if one category holds >50% of total weight (concentration),
+    its score is penalized by (1 - concentration) so 6 Sports clicks can't
+    produce an 0.88 interest score that drowns everything else.
+    """
     positive_weights = {
         _normalize_key(cat): max(float(weight), 0.0)
         for cat, weight in user.interests.items()
@@ -62,7 +93,36 @@ def _score_interest(user, category: str) -> float:
     total_weight = sum(positive_weights.values())
     if total_weight <= 0.0:
         return 0.0
-    return positive_weights.get(_normalize_key(category), 0.0) / total_weight
+
+    raw = positive_weights.get(_normalize_key(category), 0.0) / total_weight
+
+    # Entropy / concentration penalty
+    max_weight = max(positive_weights.values())
+    concentration = max_weight / total_weight
+    if concentration > _INTEREST_DOMINANCE_THRESHOLD:
+        dominant_cat = _normalize_key(max(positive_weights, key=lambda c: positive_weights[c]))
+        if _normalize_key(category) == dominant_cat:
+            # e.g. concentration=0.75 → raw *= 0.25 → Sports drops from 0.75 to ~0.19
+            raw = raw * (1.0 - concentration)
+
+    # Linear warm-up damp: full weight only after _INTEREST_WARMUP_INTERACTIONS
+    n = getattr(user, "total_positive_interactions", len(user.reading_history))
+    if n < _INTEREST_WARMUP_INTERACTIONS:
+        raw = raw * (n / _INTEREST_WARMUP_INTERACTIONS)
+
+    return raw
+
+
+def _apply_interest_ema_decay(user) -> None:
+    """Decay all interest weights by _INTEREST_EMA_ALPHA on every feedback event.
+
+    Prevents long-dormant categories from keeping accumulated weight forever.
+    Called from app.py's /feedback handler.
+    """
+    for cat in list(user.interests.keys()):
+        user.interests[cat] = user.interests[cat] * (1.0 - _INTEREST_EMA_ALPHA)
+        if user.interests[cat] < 0.01:
+            user.interests[cat] = 0.0
 
 
 def _score_popularity(article: dict) -> float:
@@ -75,16 +135,49 @@ def _score_popularity(article: dict) -> float:
         return 0.0
 
 
-def build_context_vector(user, article_embedding: np.ndarray) -> np.ndarray:
+def build_context_vector(user, article_embedding: np.ndarray, kg_score: float = 0.0) -> np.ndarray:
+    """Build 391-dim context vector: 384-dim article embedding + 7 scalars.
+
+    Scalars:
+      1: mood (normalised 0-1)
+      2: time of day (normalised 0-1)
+      3: click count (normalised 0-1)
+      4: category entropy (normalised Shannon entropy over interest weights)
+      5: recent skip ratio (fraction of last-10 interactions that were skips)
+      6: diversity hunger (unique categories in last-10 session topics / 10)
+      7: kg_score — knowledge graph affinity [0,1] for this article.
+         Passing this into the bandit lets it learn that KG-connected articles
+         are better candidates, so RL and KG work together rather than in silos.
+    """
     mood_map = {"neutral": 0, "happy": 1, "curious": 2, "stressed": 3, "tired": 4}
     time_map = {"morning": 0, "afternoon": 1, "evening": 2, "night": 3}
 
+    mood_val        = mood_map.get(user.mood, 0) / 4.0
+    time_val        = time_map.get(user.time_of_day, 0) / 3.0
+    click_count_val = min(len(user.recent_clicks) / 10.0, 1.0)
+
+    # Category entropy
+    positive = {k: max(v, 0.0) for k, v in user.interests.items() if v > 0}
+    total_w = sum(positive.values())
+    if total_w > 0 and len(positive) > 1:
+        probs = np.array(list(positive.values()), dtype=np.float32) / total_w
+        raw_e = -float(np.sum(probs * np.log(probs + 1e-9)))
+        cat_entropy = raw_e / max(float(np.log(len(positive))), 1e-9)
+    else:
+        cat_entropy = 0.0
+
+    # Recent skip ratio
+    n_skips = min(len(user.recent_skips), 10)
+    total_recent = min(len(user.recent_clicks) + len(user.recent_skips), 10)
+    skip_ratio = n_skips / max(total_recent, 1)
+
+    # Diversity hunger
+    last_topics = list(user.session_topics[-10:]) if hasattr(user, "session_topics") else []
+    diversity_hunger = len(set(last_topics)) / 10.0
+
     context_signal = np.array(
-        [
-            mood_map.get(user.mood, 0) / 4.0,
-            time_map.get(user.time_of_day, 0) / 3.0,
-            len(user.recent_clicks) / 10.0,
-        ],
+        [mood_val, time_val, click_count_val, cat_entropy, skip_ratio, diversity_hunger,
+         float(np.clip(kg_score, 0.0, 1.0))],
         dtype=np.float32,
     )
 
@@ -177,6 +270,23 @@ def _graph_bonus_map(user, graph) -> dict[str, float]:
     return {news_id: min(value / max_score, 1.0) for news_id, value in scores.items()}
 
 
+def get_kg_related_ids(
+    news_id: str,
+    graph,
+    news_id_to_idx: dict,
+    limit: int = 20,
+) -> list[str]:
+    """Return article IDs that are 1-2 hops away from news_id in the KG.
+
+    Used by app.py to propagate rewards to KG-linked articles after feedback,
+    so the bandit learns to surface related articles the user hasn't seen yet.
+    """
+    if graph is None:
+        return []
+    related = get_related_articles(news_id, graph, limit=limit)
+    return [nid for nid in related if nid != news_id and nid in news_id_to_idx]
+
+
 def build_candidate_pool(
     user,
     df: pd.DataFrame,
@@ -223,6 +333,33 @@ def build_candidate_pool(
             if 0 <= int(idx) < len(df)
         ]
         add_records(semantic_records)
+
+    # Category-balanced FAISS: after enough interactions, also retrieve from
+    # non-dominant categories to force diversity into the candidate pool.
+    if (
+        profile_vector is not None
+        and faiss_index is not None
+        and getattr(user, "total_positive_interactions", 0) >= _CAT_BALANCE_MIN_INTERACTIONS
+        and user.interests
+        and len(candidates) < max_candidates
+    ):
+        dominant_cat = _normalize_key(max(user.interests, key=lambda c: user.interests.get(c, 0.0)))
+        non_dom_df = df[df["category"].fillna("").str.lower() != dominant_cat]
+        if len(non_dom_df) > 0:
+            import faiss as _faiss
+            nd_idx = non_dom_df.index.tolist()
+            nd_embs = article_embeddings[nd_idx].astype(np.float32).copy()
+            sub_index = _faiss.IndexFlatIP(nd_embs.shape[1])
+            _faiss.normalize_L2(nd_embs)
+            sub_index.add(nd_embs)
+            bal_k = min(len(non_dom_df), max(max_candidates // 4, 20))
+            _, sub_res = sub_index.search(np.expand_dims(profile_vector.astype(np.float32), 0), bal_k)
+            bal_records = [
+                non_dom_df.iloc[int(i)].to_dict()
+                for i in sub_res[0]
+                if 0 <= int(i) < len(non_dom_df)
+            ]
+            add_records(bal_records)
 
     if len(candidates) < max_candidates and graph is not None:
         graph_news_ids = []
@@ -273,7 +410,98 @@ def build_candidate_pool(
     return candidates[:max_candidates]
 
 
-def rank_articles(user, candidate_articles: list, article_embeddings: np.ndarray, bandit, df: pd.DataFrame, G=None) -> list:
+def _apply_mmr(
+    ranked: list[dict],
+    n: int,
+    user,
+    article_embeddings: np.ndarray,
+    news_id_to_idx: dict,
+) -> list[dict]:
+    """Maximal Marginal Relevance re-ranking (λ=0.82).
+
+    Iteratively picks the article that maximises:
+        λ * relevance_score  -  (1-λ) * max_cosine_sim_to_already_selected
+
+    Articles in a "locked" category (≥ _CATEGORY_LOCK_THRESHOLD confirmed reads)
+    are inserted ahead of MMR to preserve deliberate strong preferences.
+    """
+    if n <= 0 or not ranked:
+        return ranked[:n]
+
+    # Count confirmed reads per category from the ranked pool
+    confirmed_reads: Counter = Counter()
+    news_id_to_cat: dict[str, str] = {}
+    for article in ranked:
+        nid = article.get("news_id")
+        cat = _normalize_key(article.get("category", ""))
+        if nid:
+            news_id_to_cat[nid] = cat
+    for nid in user.reading_history:
+        cat = news_id_to_cat.get(nid)
+        if cat:
+            confirmed_reads[cat] += 1
+
+    locked: list[dict] = []
+    candidates: list[dict] = []
+    for article in ranked:
+        cat = _normalize_key(article.get("category", ""))
+        if confirmed_reads.get(cat, 0) >= _CATEGORY_LOCK_THRESHOLD:
+            locked.append(article)
+        else:
+            candidates.append(article)
+
+    selected: list[dict] = []
+    selected_embeddings: list[np.ndarray] = []
+
+    while len(selected) < n and (locked or candidates):
+        # Insert locked articles first (user proved they want this category)
+        if locked:
+            article = locked.pop(0)
+            selected.append(article)
+            idx = news_id_to_idx.get(article.get("news_id"))
+            if idx is not None:
+                selected_embeddings.append(_l2_normalize(article_embeddings[idx]))
+            continue
+
+        # MMR over remaining candidates
+        best_score = -1e9
+        best_idx = -1
+        for i, article in enumerate(candidates):
+            nid = article.get("news_id")
+            idx = news_id_to_idx.get(nid)
+            if idx is None:
+                continue
+            emb_c = _l2_normalize(article_embeddings[idx])
+            relevance = float(article.get("score", 0.0))
+            if selected_embeddings:
+                max_sim = max(float(np.dot(emb_c, e)) for e in selected_embeddings)
+            else:
+                max_sim = 0.0
+            mmr_score = _MMR_LAMBDA * relevance - (1.0 - _MMR_LAMBDA) * max_sim
+            if mmr_score > best_score:
+                best_score = mmr_score
+                best_idx = i
+
+        if best_idx < 0:
+            break
+        article = candidates.pop(best_idx)
+        selected.append(article)
+        idx = news_id_to_idx.get(article.get("news_id"))
+        if idx is not None:
+            selected_embeddings.append(_l2_normalize(article_embeddings[idx]))
+
+    return selected[:n]
+
+
+def rank_articles(
+    user,
+    candidate_articles: list,
+    article_embeddings: np.ndarray,
+    bandit,
+    df: pd.DataFrame,
+    G=None,
+    n: int | None = None,
+) -> list:
     scored = []
     news_id_to_idx = _build_news_id_to_idx(df)
     profile_vector = build_user_profile_vector(user, article_embeddings, news_id_to_idx)
@@ -290,29 +518,33 @@ def rank_articles(user, candidate_articles: list, article_embeddings: np.ndarray
 
         idx = news_id_to_idx[news_id]
         article_embedding = _l2_normalize(article_embeddings[idx])
-        context_vector = build_context_vector(user, article_embedding)
+        # Pass kg_score into the context vector so the bandit learns that
+        # graph-connected articles are better candidates (RL + KG joint signal).
+        raw_kg_score = float(graph_bonus.get(news_id, 0.0))
+        context_vector = build_context_vector(user, article_embedding, kg_score=raw_kg_score)
+        category = article.get("category", "")
 
-        rl_score = float(bandit.score(news_id, context_vector)) if bandit else 0.0
+        rl_score = float(bandit.score(news_id, context_vector, category=category)) if bandit else 0.0
         semantic_score = 0.0
         if profile_vector is not None:
             semantic_score = float((np.dot(profile_vector, article_embedding) + 1.0) / 2.0)
 
-        interest_score = _score_interest(user, article.get("category", ""))
+        interest_score    = _score_interest(user, category)
         subcategory_score = _normalize_counter_score(subcategory_weights, article.get("subcategory", ""))
         candidate_entities = _extract_entity_keys(article.get("entity_ids") or article.get("entities"))
         entity_score = 0.0
         if candidate_entities:
             entity_score = max(
-                (_normalize_counter_score(entity_weights, entity_key) for entity_key in candidate_entities),
+                (_normalize_counter_score(entity_weights, ek) for ek in candidate_entities),
                 default=0.0,
             )
-        popularity_score = _score_popularity(article)
-        context_multiplier = compute_context_score(article.get("category", ""), user.mood, user.time_of_day)
-        kg_bonus = 0.20 * float(graph_bonus.get(news_id, 0.0))
-        repeat_penalty = 0.40 if news_id in previously_seen else 0.0
-        skipped_category_penalty = 0.18 * _normalize_counter_score(skipped_categories, article.get("category", ""))
-        skipped_entity_penalty = 0.08 * max(
-            (_normalize_counter_score(skipped_entities, entity_key) for entity_key in candidate_entities),
+        popularity_score    = _score_popularity(article)
+        context_multiplier = compute_context_score(category, user.mood, user.time_of_day)
+        kg_bonus            = 0.20 * raw_kg_score   # raw_kg_score already computed above
+        repeat_penalty      = 0.40 if news_id in previously_seen else 0.0
+        skipped_category_penalty = 0.28 * _normalize_counter_score(skipped_categories, category)
+        skipped_entity_penalty   = 0.08 * max(
+            (_normalize_counter_score(skipped_entities, ek) for ek in candidate_entities),
             default=0.0,
         )
         skipped_article_penalty = 0.45 if news_id in skipped_ids else 0.0
@@ -343,7 +575,12 @@ def rank_articles(user, candidate_articles: list, article_embeddings: np.ndarray
             }
         )
 
-    return sorted(scored, key=lambda x: x["score"], reverse=True)
+    sorted_articles = sorted(scored, key=lambda x: x["score"], reverse=True)
+
+    if n is not None:
+        return _apply_mmr(sorted_articles, n, user, article_embeddings, news_id_to_idx)
+
+    return sorted_articles
 
 
 def cold_start_recommendations(user, df: pd.DataFrame, n: int = 10) -> list:

@@ -18,3 +18,5 @@ python-multipart
 python-dotenv
 sqlalchemy
 datasets
+pgvector
+psycopg2-binary

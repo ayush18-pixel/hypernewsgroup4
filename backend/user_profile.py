@@ -1,6 +1,12 @@
 """
-user_profile.py — In-memory user model with Redis session layer (falls back to
-in-process dict when Redis is unavailable) and SQLite for long-term persistence.
+user_profile.py — In-memory user model with two-tier session storage:
+
+  RECENT (hot)  → Redis sorted set, keyed by timestamp (1-hour TTL).
+                  Fast sliding-window access; evicts oldest automatically.
+  LONG-TERM     → PostgreSQL + pgvector (or SQLite blob fallback) in db.py.
+                  Semantic similarity queries over all past reads.
+
+Falls back to an in-process TTL dict when Redis is unavailable.
 """
 import json
 import os
@@ -23,11 +29,14 @@ except Exception:
     _r = None
     _REDIS_OK = False
 
-# Simple TTL-aware in-memory fallback
 _mem_store: dict = {}   # {key: (value, expires_at)}
 
+_RECENT_HISTORY_TTL = 3600          # 1 hour for recent-click sorted set
+_RECENT_HISTORY_MAX = 50            # max items kept in Redis sorted set
+_SESSION_TTL        = 3600
 
-def _redis_set(key: str, value: str, ttl: int = 3600):
+
+def _redis_set(key: str, value: str, ttl: int = _SESSION_TTL):
     if _REDIS_OK:
         _r.setex(key, ttl, value)
     else:
@@ -50,6 +59,55 @@ def _redis_delete(key: str):
         _mem_store.pop(key, None)
 
 
+# ── Redis sorted-set helpers for recent history ───────────────────────────────
+
+def _history_key(user_id: str) -> str:
+    return f"history:{user_id}"
+
+
+def push_recent_history(user_id: str, article_id: str, score: float = 1.0):
+    """Add article_id to the user's recent-history sorted set.
+
+    Score = unix_timestamp so ZRANGE … BYSCORE gives chronological order.
+    We keep only the most recent _RECENT_HISTORY_MAX entries and reset TTL.
+    """
+    key = _history_key(user_id)
+    now = time.time()
+    if _REDIS_OK:
+        pipe = _r.pipeline()
+        pipe.zadd(key, {article_id: now})
+        # trim to most-recent max items
+        pipe.zremrangebyrank(key, 0, -((_RECENT_HISTORY_MAX + 1)))
+        pipe.expire(key, _RECENT_HISTORY_TTL)
+        pipe.execute()
+    else:
+        # fallback: store as a list inside _mem_store
+        raw = _mem_store.get(key)
+        lst: list = json.loads(raw[0]) if raw and time.time() < raw[1] else []
+        if article_id not in lst:
+            lst.append(article_id)
+        if len(lst) > _RECENT_HISTORY_MAX:
+            lst = lst[-_RECENT_HISTORY_MAX:]
+        _mem_store[key] = (json.dumps(lst), time.time() + _RECENT_HISTORY_TTL)
+
+
+def get_recent_history(user_id: str, limit: int = 20) -> list[str]:
+    """Return the most-recent `limit` article IDs from the hot Redis layer."""
+    key = _history_key(user_id)
+    if _REDIS_OK:
+        # ZREVRANGE returns highest-score (most recent) first
+        return list(reversed(_r.zrevrange(key, 0, limit - 1)))
+    raw = _mem_store.get(key)
+    if raw and time.time() < raw[1]:
+        lst = json.loads(raw[0])
+        return lst[-limit:][::-1]
+    return []
+
+
+def clear_recent_history(user_id: str):
+    _redis_delete(_history_key(user_id))
+
+
 # ── User Profile ──────────────────────────────────────────────────────────────
 @dataclass
 class UserProfile:
@@ -62,6 +120,17 @@ class UserProfile:
     recent_clicks:   List[str]        = field(default_factory=list)
     recent_skips:    List[str]        = field(default_factory=list)
     session_topics:  List[str]        = field(default_factory=list)
+
+    # how many positive interactions has this user had total?
+    # used to gate cold-start vs RL mode
+    total_positive_interactions: int  = 0
+
+    # incremented on every feedback event; used by EMA decay logic
+    interest_update_count: int        = 0
+
+    # ephemeral: last candidate pool served to this user (for category reward propagation)
+    # not persisted to Redis or SQLite
+    _last_candidate_pool: list        = field(default_factory=list, repr=False)
 
 
 # ── Context helpers ───────────────────────────────────────────────────────────
@@ -102,12 +171,14 @@ def update_user_session(user: UserProfile):
     """Persist short-term session data to Redis (or memory fallback) for 1 hour."""
     key = f"session:{user.user_id}"
     data = {
-        "recent_clicks":  user.recent_clicks[-20:],
-        "recent_skips":   user.recent_skips[-30:],
-        "session_topics": user.session_topics[-20:],
-        "mood":           user.mood,
+        "recent_clicks":               user.recent_clicks[-20:],
+        "recent_skips":                user.recent_skips[-30:],
+        "session_topics":              user.session_topics[-20:],
+        "mood":                        user.mood,
+        "total_positive_interactions": user.total_positive_interactions,
+        "interest_update_count":       user.interest_update_count,
     }
-    _redis_set(key, json.dumps(data), ttl=3600)
+    _redis_set(key, json.dumps(data), ttl=_SESSION_TTL)
 
 
 def load_user_session(user_id: str) -> dict:
@@ -119,5 +190,6 @@ def load_user_session(user_id: str) -> dict:
 
 
 def clear_user_session(user_id: str):
-    """Remove short-term session state for a user."""
+    """Remove short-term session state and recent-history sorted set."""
     _redis_delete(f"session:{user_id}")
+    clear_recent_history(user_id)
