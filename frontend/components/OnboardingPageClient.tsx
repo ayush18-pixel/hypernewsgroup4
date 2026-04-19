@@ -57,6 +57,11 @@ export default function OnboardingPageClient({ initialProfile }: Props) {
   const activeStep = STEPS[stepIndex];
 
   async function handleComplete() {
+    if (topCategories.length === 0 && !interestText.trim()) {
+      setError("Please select at least one top category or add a note about your interests before finishing.");
+      return;
+    }
+
     setSaving(true);
     setError("");
 
