@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from "recharts";
-import type { NameType, ValueType } from "recharts/types/component/DefaultTooltipContent";
+import type { Formatter, NameType, ValueType } from "recharts/types/component/DefaultTooltipContent";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -16,7 +16,7 @@ interface Props {
   userId: string;
 }
 
-function formatInterestValue(value: ValueType, _name: NameType): [string, string] {
+const formatInterestValue: Formatter<ValueType, NameType> = (value, _name) => {
   const rawValue = Array.isArray(value) ? value[0] : value;
   const numericValue =
     typeof rawValue === "number" && Number.isFinite(rawValue)
@@ -24,7 +24,7 @@ function formatInterestValue(value: ValueType, _name: NameType): [string, string
       : Number(rawValue ?? 0);
   const safeValue = Number.isFinite(numericValue) ? numericValue : 0;
   return [`${safeValue.toFixed(2)} pts`, "Interest Score"];
-}
+};
 
 export default function InterestChart({ userId }: Props) {
   const [data, setData] = useState<{ name: string; value: number }[]>([]);
