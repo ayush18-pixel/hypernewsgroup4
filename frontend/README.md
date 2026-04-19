@@ -6,13 +6,13 @@ This is the Next.js frontend for HyperNews.
 
 ```bash
 npm install
-NEXT_PUBLIC_API_URL=http://localhost:8000 npm run dev
+npm run dev
 ```
 
 Open:
 
 ```text
-http://localhost:3000
+http://127.0.0.1:3000
 ```
 
 ## Backend Requirement
@@ -20,10 +20,20 @@ http://localhost:3000
 The frontend expects the FastAPI backend to be running on:
 
 ```text
-http://localhost:8000
+http://127.0.0.1:8000
 ```
 
-You can override that with `NEXT_PUBLIC_API_URL`.
+If you do override `NEXT_PUBLIC_API_URL` on Windows, avoid adding a trailing space.
+
+For cloud deployment on Vercel, set:
+
+```env
+AUTH_SECRET=<shared-secret>
+NEXTAUTH_SECRET=<shared-secret>
+NEXTAUTH_URL=https://<your-vercel-domain>
+HYPERNEWS_BACKEND_URL=https://<your-render-domain>
+NEXT_PUBLIC_API_URL=https://<your-render-domain>
+```
 
 ## Notes
 
@@ -40,3 +50,8 @@ npx next dev --webpack
   - `/graph`
   - `/profile/:user_id`
   - `/reset/:user_id`
+
+- The recommended free deployment split is:
+  - frontend on `Vercel Hobby`
+  - backend on `Render` using the repo root `Dockerfile`
+  - durable storage on `Supabase Postgres`

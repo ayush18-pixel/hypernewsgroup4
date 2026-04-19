@@ -23,9 +23,15 @@ wheels/
 *.egg
 
 # Data & Models
-data/
+data/**
+!data/
+!data/articles.parquet
+!data/article_embeddings.npy
 graph/*.pkl
-models/*.pkl
+models/**
+!models/
+!models/ltr_model.txt
+!models/ltr_model.txt.weights.json
 
 # Environment & Secrets
 .env
@@ -38,6 +44,15 @@ out/
 
 # Logs
 *.log
+artifacts/
+*.stdout.log
+*.stderr.log
+*.pid
+
+# Test & Local Caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # OS
 .DS_Store
