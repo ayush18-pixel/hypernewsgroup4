@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { Maximize2, Minimize2 } from "lucide-react";
 
@@ -40,7 +40,7 @@ interface GraphResponse {
 }
 
 interface GraphData {
-  nodes: Array<GraphNode & { val: number; name: string }>;
+  nodes: Array<GraphNode & { val: number; name: string; color: string; tooltip: string }>;
   links: GraphLink[];
 }
 
@@ -74,6 +74,8 @@ export default function KnowledgeGraphPanel() {
           nodes: data.nodes.map((node) => ({
             ...node,
             name: node.label,
+            color: TYPE_COLORS[node.type] ?? "#94a3b8",
+            tooltip: `${node.label} (${node.type})`,
             val:
               node.type === "article"
                 ? 2.5
@@ -98,8 +100,6 @@ export default function KnowledgeGraphPanel() {
     window.addEventListener("resize", updateDimensions);
     return () => window.removeEventListener("resize", updateDimensions);
   }, [isExpanded]);
-
-  const getNodeColor = useCallback((node: GraphNode) => TYPE_COLORS[node.type] ?? "#94a3b8", []);
 
   if (!graphData || graphData.nodes.length === 0) return null;
 
@@ -129,8 +129,8 @@ export default function KnowledgeGraphPanel() {
           width={dimensions.width}
           height={dimensions.height}
           graphData={graphData}
-          nodeLabel={(node: GraphNode) => `${node.label} (${node.type})`}
-          nodeColor={getNodeColor}
+          nodeLabel="tooltip"
+          nodeColor="color"
           nodeRelSize={5}
           linkColor={() => "rgba(255,255,255,0.11)"}
           backgroundColor="transparent"
