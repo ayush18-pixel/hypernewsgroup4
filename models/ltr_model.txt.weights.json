@@ -1,0 +1,19 @@
+{
+  "weights": {
+    "semantic_score": 0.19494276296355795,
+    "retrieval_score": 0.0,
+    "lexical_score": 0.0,
+    "memory_score": 0.199598929874263,
+    "kg_score": 0.09232002934631456,
+    "entity_score": 0.0,
+    "subcategory_score": 0.09499057376391361,
+    "popularity_score": 0.22908786015460086,
+    "context_score": -0.003797155829128265,
+    "negative_score": 0.0,
+    "interest_score": 0.0,
+    "bandit_score": 0.0,
+    "position": -0.18526268806822177,
+    "dwell_time": 0.0
+  },
+  "features_csv": "data\\ltr_features.smoke.csv"
+}
