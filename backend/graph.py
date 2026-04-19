@@ -20,6 +20,23 @@ except ImportError:
 
 _KG_PATH = os.path.join(os.path.dirname(__file__), "..", "graph", "knowledge_graph.pkl")
 _GRAPH_VERSION = 2
+_NOISY_ENTITY_LABELS = {
+    "this",
+    "that",
+    "these",
+    "those",
+    "from",
+    "with",
+    "what",
+    "when",
+    "where",
+    "after",
+    "before",
+    "best",
+    "your",
+    "their",
+    "our",
+}
 
 try:
     import spacy
@@ -300,10 +317,18 @@ def get_graph_stats(graph: nx.Graph) -> dict:
         if node_type == "category":
             categories.append(attrs.get("label", node_id))
         elif node_type not in ("article", "subcategory"):
+            label = str(attrs.get("label", node_id) or "").strip()
+            normalized_label = _normalize_key(label)
+            if (
+                node_type == "ENTITY"
+                and not attrs.get("wikidata_id")
+                and (normalized_label in _NOISY_ENTITY_LABELS or len(normalized_label) <= 3)
+            ):
+                continue
             entity_entries.append(
                 {
                     "node_id": node_id,
-                    "id": attrs.get("label", node_id),
+                    "id": label,
                     "type": node_type,
                     "connections": int(graph.degree(node_id)),
                     "wikidata_id": attrs.get("wikidata_id"),

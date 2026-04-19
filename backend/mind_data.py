@@ -212,7 +212,8 @@ def _compute_popularity(behavior_paths: Iterable[str]) -> tuple[Counter, Counter
             header=None,
             names=BEHAVIOR_COLUMNS,
             usecols=["impressions"],
-            chunksize=25_000,
+            dtype={"impressions": "string"},
+            chunksize=5_000,
         ):
             for raw_impressions in chunk["impressions"].dropna():
                 for item in str(raw_impressions).split():

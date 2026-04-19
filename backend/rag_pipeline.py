@@ -7,12 +7,15 @@ Otherwise a deterministic, mood-aware fallback is used.
 
 import os
 import re
-from typing import Dict, List
+from typing import Any, Dict, List
 
-import faiss
 import numpy as np
 import pandas as pd
-from sentence_transformers import SentenceTransformer
+
+try:
+    from backend.coldstart_hints import humanize_location
+except ImportError:
+    from coldstart_hints import humanize_location
 
 _GROQ_KEY = os.getenv("GROQ_API_KEY", "")
 _llm = None
@@ -33,20 +36,56 @@ _HNSW_EF_CONSTRUCTION = 200
 _HNSW_EF_SEARCH       = 64
 
 
-def build_faiss_index(embeddings: np.ndarray) -> faiss.IndexHNSWFlat:
-    """Build an HNSW index (cosine similarity via L2-normalised inner product).
+def _normalize_matrix(matrix: np.ndarray) -> np.ndarray:
+    arr = np.asarray(matrix, dtype=np.float32)
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return arr / norms
 
-    Significantly faster than IndexFlatIP for large datasets while maintaining
-    >97% recall@10 at the configured efSearch setting.
-    """
-    dimension = embeddings.shape[1]
-    index = faiss.IndexHNSWFlat(dimension, _HNSW_M)
-    index.hnsw.efConstruction = _HNSW_EF_CONSTRUCTION
-    index.hnsw.efSearch = _HNSW_EF_SEARCH
-    emb = embeddings.copy().astype("float32")
-    faiss.normalize_L2(emb)
-    index.add(emb)
-    return index
+
+class NumpyVectorIndex:
+    """Small cosine-similarity index with a FAISS-like `search` surface."""
+
+    def __init__(self, embeddings: np.ndarray):
+        self.embeddings = _normalize_matrix(embeddings)
+        self.ntotal = int(self.embeddings.shape[0])
+
+    def add(self, embeddings: np.ndarray):
+        rows = _normalize_matrix(embeddings)
+        if self.ntotal == 0:
+            self.embeddings = rows
+        else:
+            self.embeddings = np.vstack([self.embeddings, rows]).astype(np.float32)
+        self.ntotal = int(self.embeddings.shape[0])
+
+    def search(self, queries: np.ndarray, top_k: int):
+        query_matrix = _normalize_matrix(queries)
+        k = max(0, min(int(top_k), self.ntotal))
+        if self.ntotal == 0 or k == 0:
+            empty_scores = np.empty((len(query_matrix), 0), dtype=np.float32)
+            empty_indices = np.empty((len(query_matrix), 0), dtype=np.int64)
+            return empty_scores, empty_indices
+
+        scores = query_matrix @ self.embeddings.T
+        order = np.argsort(-scores, axis=1)[:, :k]
+        top_scores = np.take_along_axis(scores, order, axis=1)
+        return top_scores.astype(np.float32), order.astype(np.int64)
+
+
+def build_faiss_index(embeddings: np.ndarray):
+    """Build a lightweight cosine index with the same search contract."""
+    return NumpyVectorIndex(embeddings)
+
+
+def load_vector_index(path: str | None):
+    # Existing FAISS files are ignored when FAISS is unavailable or unhealthy.
+    return None
+
+
+def save_vector_index(index, path: str) -> bool:
+    return False
 
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
@@ -76,26 +115,41 @@ def _tokenize(text: str) -> list[str]:
     ]
 
 
+def encode_query_embedding(query: str, model: Any) -> np.ndarray | None:
+    if not query or model is None:
+        return None
+    embedding = model.encode([query], normalize_embeddings=True).astype("float32")
+    if len(embedding) == 0:
+        return None
+    return embedding[0]
+
+
 def retrieve_articles(
     query: str,
-    index: faiss.Index,
+    index,
     df: pd.DataFrame,
-    model: SentenceTransformer,
+    model: Any,
     top_k: int = 10,
 ) -> List[Dict]:
     if not query or len(df) == 0:
         return []
 
     search_k = min(len(df), max(top_k * 6, 40))
-    query_emb = model.encode([query], normalize_embeddings=True).astype("float32")
-    distances, indices = index.search(query_emb, search_k)
-
+    query_vec = encode_query_embedding(query, model)
     query_lower = query.strip().lower()
     query_tokens = _tokenize(query)
+    semantic_pairs: list[tuple[float, int]] = []
+    if query_vec is not None and index is not None:
+        query_emb = np.expand_dims(query_vec.astype("float32"), axis=0)
+        distances, indices = index.search(query_emb, search_k)
+        semantic_pairs = [
+            (float(score), int(idx))
+            for score, idx in zip(distances[0], indices[0])
+            if 0 <= int(idx) < len(df)
+        ]
     semantic_scores = {
-        int(idx): float(score)
-        for score, idx in zip(distances[0], indices[0])
-        if 0 <= int(idx) < len(df)
+        idx: score
+        for score, idx in semantic_pairs
     }
 
     candidate_ids: list[int] = []
@@ -106,8 +160,8 @@ def retrieve_articles(
             seen_ids.add(idx)
             candidate_ids.append(idx)
 
-    for idx in indices[0]:
-        add_idx(int(idx))
+    for _, idx in semantic_pairs:
+        add_idx(idx)
 
     if query_lower:
         phrase_mask = (
@@ -122,6 +176,21 @@ def retrieve_articles(
             category_mask = category_mask | df["subcategory"].fillna("").str.lower().eq(query_lower)
         for idx in df[category_mask].index[:search_k]:
             add_idx(int(idx))
+
+    if query_tokens:
+        lexical_text = (
+            df["title"].fillna("").astype(str)
+            + " "
+            + df["abstract"].fillna("").astype(str)
+            + " "
+            + df["category"].fillna("").astype(str)
+            + " "
+            + df["subcategory"].fillna("").astype(str)
+        ).str.lower()
+        for token in query_tokens[:6]:
+            token_mask = lexical_text.str.contains(re.escape(token), case=False, na=False)
+            for idx in lexical_text[token_mask].index[:search_k]:
+                add_idx(int(idx))
 
     scored = []
     for idx in candidate_ids:
@@ -139,7 +208,7 @@ def retrieve_articles(
         phrase_bonus = 0.20 if query_lower and query_lower in article_text else 0.0
         category_bonus = 0.20 if str(article.get("category", "")).lower() == query_lower else 0.0
         semantic_score = semantic_scores.get(idx, 0.0)
-        combined_score = (0.72 * semantic_score) + (0.28 * lexical_score) + phrase_bonus + category_bonus
+        combined_score = (0.55 * semantic_score) + (0.45 * lexical_score) + phrase_bonus + category_bonus
         scored.append(
             {
                 **article,
@@ -194,12 +263,47 @@ def _category_mix(articles: List[dict]) -> str:
     return f"{labels[0]}, {labels[1]}, and {labels[2]}"
 
 
+def _profile_preference_summary(user_context: dict) -> str:
+    selected_categories = [
+        str(value).strip().lower()
+        for value in user_context.get("top_categories", []) or []
+        if str(value).strip()
+    ]
+    hinted_categories = [
+        str(value).strip().lower()
+        for value in user_context.get("profile_hint_categories", []) or []
+        if str(value).strip()
+    ]
+    location_label = humanize_location(
+        str(user_context.get("location_region") or ""),
+        str(user_context.get("location_country") or ""),
+    )
+    interest_text = str(user_context.get("interest_text") or "").strip()
+
+    fragments: list[str] = []
+    if selected_categories:
+        fragments.append(f"selected categories like {', '.join(selected_categories[:3])}")
+    if hinted_categories:
+        fragments.append(f"interest-note hints leaning toward {', '.join(hinted_categories[:2])}")
+    if interest_text:
+        fragments.append(f"your note '{interest_text[:72]}'")
+    if location_label:
+        fragments.append(f"location context around {location_label}")
+
+    if not fragments:
+        return ""
+    if len(fragments) == 1:
+        return fragments[0]
+    return ", ".join(fragments[:-1]) + f", and {fragments[-1]}"
+
+
 def _fallback_explanation(user_context: dict, articles: List[dict]) -> str:
     mood = str(user_context.get("mood", "neutral")).strip().lower()
     time_slot = str(user_context.get("time_of_day", "morning")).strip().lower()
     mode = str(user_context.get("mode", "rl")).strip().lower()
     query = str(user_context.get("query") or "").strip()
     category_mix = _category_mix(articles)
+    preference_summary = _profile_preference_summary(user_context)
 
     mood_sentence_map = {
         "curious": f"Because you're feeling curious this {time_slot}, the feed leans into discovery-oriented stories across {category_mix}.",
@@ -210,12 +314,16 @@ def _fallback_explanation(user_context: dict, articles: List[dict]) -> str:
     }
     mode_sentence_map = {
         "rag": (
-            f"Your search for '{query}' is steering retrieval first, then the ranker is reordering those candidates using mood, context, and prior feedback."
+            f"Your search for '{query}' is steering retrieval first, then the ranker is reordering those candidates across {category_mix} using prior feedback and session context."
             if query
-            else "The retrieval step is pulling semantically similar articles first, then the ranker is reordering them using mood, context, and prior feedback."
+            else f"The retrieval step is pulling semantically similar articles first, then the ranker is reordering them across {category_mix} using mood, context, and prior feedback."
         ),
-        "cold_start": "Because this session has little or no reading history yet, the system is relying more on mood, time of day, and category diversity than long-term personalization.",
-        "rl": "The ranker is using your recent feedback and session context to reshuffle the feed, so the order should adapt as you read, save, or skip.",
+        "cold_start": (
+            f"Because this session has little or no reading history yet, the system is leaning hard on {preference_summary} while still keeping some diversity across {category_mix}."
+            if preference_summary
+            else f"Because this session has little or no reading history yet, the system is relying more on mood, time of day, and category diversity across {category_mix} than long-term behavior."
+        ),
+        "rl": f"The ranker is using your recent feedback and session context to reshuffle the feed, so the order should keep adapting across {category_mix} as you read, save, or skip.",
     }
 
     first_sentence = mood_sentence_map.get(mood, mood_sentence_map["neutral"])

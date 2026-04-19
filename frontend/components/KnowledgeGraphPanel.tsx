@@ -1,13 +1,15 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { Maximize2, Minimize2 } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { apiUrl } from "@/lib/api";
+import { Pill, StateBlock, SurfaceCard } from "@/components/ui/primitives";
 
 const ForceGraph2D = dynamic(() => import("react-force-graph-2d"), {
   ssr: false,
   loading: () => (
-    <div style={{ height: 350, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-muted)" }}>
+    <div className="flex h-[350px] items-center justify-center text-sm text-[var(--muted)]">
       Loading graph...
     </div>
   ),
@@ -46,7 +48,7 @@ interface GraphData {
 
 const TYPE_COLORS: Record<string, string> = {
   article: "#64748b",
-  category: "#ef4444",
+  category: "#e6b86c",
   subcategory: "#f97316",
   PERSON: "#10b981",
   GPE: "#f59e0b",
@@ -60,15 +62,17 @@ const TYPE_COLORS: Record<string, string> = {
 export default function KnowledgeGraphPanel() {
   const [graphData, setGraphData] = useState<GraphData | null>(null);
   const [topEntities, setTopEntities] = useState<GraphEntity[]>([]);
-  const [dimensions, setDimensions] = useState({ width: 800, height: 400 });
+  const [dimensions, setDimensions] = useState({ width: 800, height: 360 });
   const [isExpanded, setIsExpanded] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    fetch(`${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}/graph`)
+    fetch(apiUrl("/graph"))
       .then((response) => response.json())
       .then((data: GraphResponse) => {
-        if (data.error || !data.nodes?.length) return;
+        if (data.error || !data.nodes?.length) {
+          return;
+        }
         setTopEntities(data.top_entities ?? []);
         setGraphData({
           nodes: data.nodes.map((node) => ({
@@ -77,7 +81,10 @@ export default function KnowledgeGraphPanel() {
             val:
               node.type === "article"
                 ? 2.5
-                : Math.max(3, Math.min(12, (node.degree ?? 1) / (node.type === "category" ? 1.3 : 1.8))),
+                : Math.max(
+                    3,
+                    Math.min(12, (node.degree ?? 1) / (node.type === "category" ? 1.3 : 1.8)),
+                  ),
           })),
           links: data.links ?? [],
         });
@@ -86,50 +93,65 @@ export default function KnowledgeGraphPanel() {
   }, []);
 
   useEffect(() => {
-    const updateDimensions = () => {
-      if (!containerRef.current) return;
+    const update = () => {
+      if (!containerRef.current) {
+        return;
+      }
       setDimensions({
         width: containerRef.current.clientWidth,
         height: isExpanded ? 620 : 360,
       });
     };
 
-    updateDimensions();
-    window.addEventListener("resize", updateDimensions);
-    return () => window.removeEventListener("resize", updateDimensions);
+    update();
+    window.addEventListener("resize", update);
+    return () => window.removeEventListener("resize", update);
   }, [isExpanded]);
 
-  const getNodeColor = useCallback((node: GraphNode) => TYPE_COLORS[node.type] ?? "#94a3b8", []);
+  const getNodeColor = useCallback((node: unknown) => {
+    const parsed = node as Partial<GraphNode>;
+    return TYPE_COLORS[String(parsed.type ?? "")] ?? "#94a3b8";
+  }, []);
 
-  if (!graphData || graphData.nodes.length === 0) return null;
+  if (!graphData || graphData.nodes.length === 0) {
+    return (
+      <SurfaceCard className="space-y-4">
+        <h3 className="text-lg font-semibold text-[var(--foreground)]">Knowledge graph</h3>
+        <StateBlock
+          title="Graph unavailable"
+          description="No entity graph data available yet. Read more articles to build graph connections."
+          tone="warning"
+        />
+      </SurfaceCard>
+    );
+  }
 
   return (
-    <div
-      ref={containerRef}
-      className="glass-card"
-      style={{ marginTop: 24, padding: 16, position: "relative", transition: "all 0.3s ease" }}
-    >
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-        <h3 style={{ margin: 0, fontSize: 16, display: "flex", alignItems: "center", gap: 8 }}>
-          Entity Knowledge Graph
-          <span style={{ fontSize: 12, color: "var(--text-muted)", fontWeight: "normal" }}>
-            (real category/article/entity edges from the dataset)
-          </span>
-        </h3>
+    <SurfaceCard className="space-y-4" ref={containerRef}>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <h3 className="text-lg font-semibold text-[var(--foreground)]">Knowledge graph</h3>
         <button
-          onClick={() => setIsExpanded(!isExpanded)}
-          style={{ background: "transparent", border: "none", color: "var(--text-secondary)", cursor: "pointer" }}
+          onClick={() => setIsExpanded((current) => !current)}
+          className="rounded-full border border-white/12 bg-[linear-gradient(180deg,rgba(255,255,255,0.12),rgba(255,255,255,0.04))] px-4 py-2 text-xs uppercase tracking-[0.18em] text-[var(--muted-strong)] backdrop-blur-xl"
         >
-          {isExpanded ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
+          {isExpanded ? (
+            <Minimize2 size={14} className="mr-1 inline" />
+          ) : (
+            <Maximize2 size={14} className="mr-1 inline" />
+          )}
+          {isExpanded ? "Collapse" : "Expand"}
         </button>
       </div>
 
-      <div style={{ borderRadius: 8, overflow: "hidden", background: "rgba(0,0,0,0.2)", border: "1px solid var(--glass-border)" }}>
+      <div className="overflow-hidden rounded-[20px] border border-white/10 bg-[radial-gradient(circle_at_center,rgba(230,184,108,0.08),transparent_60%),linear-gradient(180deg,rgba(255,255,255,0.05),rgba(255,255,255,0.02))]">
         <ForceGraph2D
-          width={dimensions.width}
+          width={Math.max(320, dimensions.width - 40)}
           height={dimensions.height}
           graphData={graphData}
-          nodeLabel={(node: GraphNode) => `${node.label} (${node.type})`}
+          nodeLabel={(node) => {
+            const parsed = node as Partial<GraphNode>;
+            return `${parsed.label ?? parsed.id} (${parsed.type ?? "entity"})`;
+          }}
           nodeColor={getNodeColor}
           nodeRelSize={5}
           linkColor={() => "rgba(255,255,255,0.11)"}
@@ -140,7 +162,7 @@ export default function KnowledgeGraphPanel() {
         />
       </div>
 
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginTop: 12, fontSize: 11, color: "var(--text-secondary)" }}>
+      <div className="flex flex-wrap gap-3 text-xs text-[var(--muted)]">
         {[
           { color: TYPE_COLORS.category, label: "Category" },
           { color: TYPE_COLORS.article, label: "Article" },
@@ -149,30 +171,25 @@ export default function KnowledgeGraphPanel() {
           { color: TYPE_COLORS.GPE, label: "Location" },
           { color: TYPE_COLORS.CONCEPT, label: "Concept" },
         ].map(({ color, label }) => (
-          <div key={label} style={{ display: "flex", alignItems: "center", gap: 4 }}>
-            <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: color }} />
+          <div key={label} className="flex items-center gap-1.5">
+            <span className="inline-block h-2 w-2 rounded-full" style={{ background: color }} />
             {label}
           </div>
         ))}
       </div>
 
       {topEntities.length > 0 && (
-        <div style={{ marginTop: 14, display: "flex", flexWrap: "wrap", gap: 8 }}>
-          {topEntities.slice(0, 10).map((entity) => (
-            <span
-              key={`${entity.id}-${entity.type}`}
-              className="badge"
-              style={{
-                background: "rgba(255,255,255,0.04)",
-                color: "var(--text-secondary)",
-                border: "1px solid var(--glass-border)",
-              }}
-            >
-              {entity.id} · {entity.connections}
-            </span>
-          ))}
+        <div className="space-y-3">
+          <p className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">Top entities</p>
+          <div className="flex flex-wrap gap-2">
+            {topEntities.slice(0, 10).map((entity, index) => (
+              <Pill key={`${entity.id}-${entity.type}`} active={index === 0}>
+                {entity.id} | {entity.connections}
+              </Pill>
+            ))}
+          </div>
         </div>
       )}
-    </div>
+    </SurfaceCard>
   );
 }

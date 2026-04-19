@@ -1,6 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import Link from "next/link";
+import { usePathname } from "next/navigation";
+import { Button, Pill, RangeSlider, cx } from "@/components/ui/primitives";
 
 interface Mood {
   key: string;
@@ -9,220 +11,243 @@ interface Mood {
 }
 
 interface Props {
-  userId: string;
-  setUserId: (v: string) => void;
+  surface: "feed" | "search";
+  isAuthenticated: boolean;
+  userLabel: string;
   mood: string;
   setMood: (v: string) => void;
   moods: Mood[];
   query: string;
   setQuery: (v: string) => void;
+  suggestions: string[];
+  onSearch: () => void;
   onRefresh: () => void;
-  onNewSession: () => void;
+  onResetProfile: () => void;
+  onSignOut: () => void;
+  onSignIn: () => void;
+  onRegister: () => void;
   loading: boolean;
   mode: string;
+  exploreFocus: number;
+  setExploreFocus: (v: number) => void;
+  affectEnabled: boolean;
+  setAffectEnabled: () => void;
+  affectSensor?: React.ReactNode;
 }
 
-function getTimeLabel(): string {
-  const hour = new Date().getHours();
-  if (hour >= 5 && hour < 12) return "🌅 Morning";
-  if (hour >= 12 && hour < 17) return "☀️ Afternoon";
-  if (hour >= 17 && hour < 21) return "🌆 Evening";
-  return "🌙 Night";
-}
+const NAV_ITEMS = [
+  { href: "/", label: "Home" },
+  { href: "/feed", label: "Feed" },
+  { href: "/search", label: "Search" },
+  { href: "/dashboard", label: "Dashboard" },
+  { href: "/profile/settings", label: "Profile" },
+];
 
-const MODE_COLORS: Record<string, string> = {
-  rag: "#6366f1",
-  rl: "#22c55e",
-  cold_start: "#f59e0b",
+const MODE_LABELS: Record<string, string> = {
+  rag: "RAG",
+  rl: "RL",
+  cold_start: "Cold Start",
 };
 
 export default function ContextBar({
-  userId,
-  setUserId,
+  surface,
+  isAuthenticated,
+  userLabel,
   mood,
   setMood,
   moods,
   query,
   setQuery,
+  suggestions,
+  onSearch,
   onRefresh,
-  onNewSession,
+  onResetProfile,
+  onSignOut,
+  onSignIn,
+  onRegister,
   loading,
   mode,
+  exploreFocus,
+  setExploreFocus,
+  affectEnabled,
+  setAffectEnabled,
+  affectSensor,
 }: Props) {
-  const [editId, setEditId] = useState(false);
-  const [draftUserId, setDraftUserId] = useState(userId);
-
-  useEffect(() => {
-    setDraftUserId(userId);
-  }, [userId]);
-
-  const commitUserId = () => {
-    const nextUserId = draftUserId.trim();
-    if (nextUserId) {
-      setUserId(nextUserId);
+  const pathname = usePathname();
+  const isActive = (href: string) => {
+    if (!pathname) {
+      return false;
     }
-    setEditId(false);
+    if (href === "/profile/settings") {
+      return pathname === "/profile" || pathname.startsWith("/profile/");
+    }
+    return pathname === href;
   };
 
   return (
-    <header
-      style={{
-        position: "sticky",
-        top: 0,
-        zIndex: 100,
-        background: "rgba(10,14,26,0.85)",
-        backdropFilter: "blur(20px)",
-        borderBottom: "1px solid var(--glass-border)",
-        padding: "0 24px",
-      }}
-    >
-      <div style={{ display: "flex", alignItems: "center", gap: 16, minHeight: 64, padding: "10px 0" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
-          <span style={{ fontSize: 22 }}>🧠</span>
-          <span
-            style={{
-              fontWeight: 800,
-              fontSize: 18,
-              background: "linear-gradient(135deg,#818cf8,#a78bfa)",
-              WebkitBackgroundClip: "text",
-              WebkitTextFillColor: "transparent",
-            }}
-          >
-            HyperNews
-          </span>
-        </div>
-
-        <div style={{ flex: 1, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-          <input
-            type="text"
-            placeholder="Search with AI (RAG mode)..."
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && onRefresh()}
-            style={{
-              flex: 1,
-              minWidth: 240,
-              background: "var(--glass-bg)",
-              border: "1px solid var(--glass-border)",
-              borderRadius: 10,
-              padding: "8px 14px",
-              fontSize: 13,
-              color: "var(--text-primary)",
-              outline: "none",
-            }}
-          />
-
-          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-            <span style={{ fontSize: 12, color: "var(--text-muted)" }}>User:</span>
-            {editId ? (
-              <input
-                autoFocus
-                value={draftUserId}
-                onChange={(e) => setDraftUserId(e.target.value)}
-                onBlur={commitUserId}
-                onKeyDown={(e) => e.key === "Enter" && commitUserId()}
-                style={{
-                  width: 150,
-                  background: "var(--glass-bg)",
-                  border: "1px solid var(--accent-light)",
-                  borderRadius: 6,
-                  padding: "4px 8px",
-                  fontSize: 12,
-                  color: "var(--text-primary)",
-                  outline: "none",
-                }}
-              />
-            ) : (
-              <button
-                onClick={() => {
-                  setDraftUserId(userId);
-                  setEditId(true);
-                }}
-                style={{
-                  background: "var(--glass-bg)",
-                  border: "1px solid var(--glass-border)",
-                  borderRadius: 6,
-                  padding: "4px 10px",
-                  fontSize: 12,
-                  color: "var(--accent-light)",
-                  cursor: "pointer",
-                }}
-              >
-                {userId || "loading..."}
-              </button>
-            )}
+    <header className="gold-ring panel-glow mac-glass-heavy rounded-[30px] px-5 py-4 sm:px-6">
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <Link href="/" className="flex items-center gap-3">
+          <div className="flex h-11 w-11 items-center justify-center rounded-full bg-[var(--accent)] text-sm font-bold text-black">
+            HN
           </div>
+          <div>
+            <p className="font-mono text-[11px] uppercase tracking-[0.3em] text-[var(--accent-soft)]">
+              HyperNews
+            </p>
+            <p className="font-display text-2xl leading-none text-[var(--foreground)]">
+              Personal news, staged cinematically.
+            </p>
+          </div>
+        </Link>
 
-          <span style={{ fontSize: 12, color: "var(--text-muted)", flexShrink: 0 }}>{getTimeLabel()}</span>
-
-          {mode && (
-            <span
-              style={{
-                fontSize: 11,
-                fontWeight: 700,
-                padding: "3px 8px",
-                borderRadius: 6,
-                background: `${MODE_COLORS[mode] || "#475569"}22`,
-                color: MODE_COLORS[mode] || "#94a3b8",
-                border: `1px solid ${MODE_COLORS[mode] || "#475569"}44`,
-              }}
+        <nav className="flex flex-wrap items-center gap-2">
+          {NAV_ITEMS.map((item) => (
+            <Link
+              key={item.href}
+              href={item.href}
+              className={cx(
+                "rounded-full px-4 py-2 text-sm transition",
+                isActive(item.href)
+                  ? "bg-[var(--accent)] text-black"
+                  : "border border-white/10 bg-[linear-gradient(180deg,rgba(255,255,255,0.1),rgba(255,255,255,0.04))] text-[var(--muted-strong)] backdrop-blur-xl hover:bg-[linear-gradient(180deg,rgba(255,255,255,0.14),rgba(255,255,255,0.05))]",
+              )}
             >
-              {mode.toUpperCase()}
+              {item.label}
+            </Link>
+          ))}
+        </nav>
+
+        <div className="flex flex-wrap items-center gap-3">
+          {mode && (
+            <span className="rounded-full border border-white/10 bg-white/[0.06] px-3 py-1 font-mono text-xs uppercase tracking-[0.2em] text-[var(--accent-soft)] backdrop-blur-xl">
+              {MODE_LABELS[mode] ?? mode}
             </span>
           )}
-
-          <button
-            onClick={onNewSession}
-            disabled={loading}
-            style={{
-              background: "rgba(255,255,255,0.03)",
-              border: "1px solid var(--glass-border)",
-              borderRadius: 10,
-              padding: "8px 14px",
-              fontSize: 13,
-              fontWeight: 700,
-              color: "var(--text-secondary)",
-              cursor: loading ? "wait" : "pointer",
-              opacity: loading ? 0.7 : 1,
-            }}
-          >
-            Fresh Session
-          </button>
-
-          <button
-            onClick={onRefresh}
-            disabled={loading}
-            className="pulse-glow"
-            style={{
-              background: "linear-gradient(135deg, #6366f1, #8b5cf6)",
-              border: "none",
-              borderRadius: 10,
-              padding: "8px 18px",
-              fontSize: 13,
-              fontWeight: 700,
-              color: "#fff",
-              cursor: loading ? "wait" : "pointer",
-              opacity: loading ? 0.7 : 1,
-              transition: "all 0.2s",
-              flexShrink: 0,
-            }}
-          >
-            {loading ? "Loading..." : "Refresh"}
-          </button>
+          {isAuthenticated ? (
+            <>
+              <span className="rounded-full border border-white/10 bg-[linear-gradient(180deg,rgba(255,255,255,0.12),rgba(255,255,255,0.05))] px-4 py-2 text-sm text-[var(--muted-strong)] backdrop-blur-xl">
+                {userLabel}
+              </span>
+              <Button
+                variant="ghost"
+                onClick={onResetProfile}
+                disabled={loading}
+                className="px-4 py-2 text-xs"
+              >
+                Reset
+              </Button>
+              <Button variant="ghost" onClick={onSignOut} className="px-4 py-2 text-xs">
+                Sign out
+              </Button>
+            </>
+          ) : (
+            <>
+              <Button variant="ghost" onClick={onSignIn} className="px-4 py-2 text-xs">
+                Sign in
+              </Button>
+              <Button onClick={onRegister} className="px-4 py-2 text-xs">
+                Register
+              </Button>
+              <Button
+                variant="ghost"
+                onClick={onResetProfile}
+                disabled={loading}
+                className="px-4 py-2 text-xs"
+              >
+                Reset session
+              </Button>
+            </>
+          )}
         </div>
       </div>
 
-      <div style={{ display: "flex", alignItems: "center", gap: 8, paddingBottom: 12, paddingTop: 2, flexWrap: "wrap" }}>
-        <span style={{ fontSize: 12, color: "var(--text-muted)", marginRight: 4 }}>Mood:</span>
-        {moods.map((moodOption) => (
-          <button
-            key={moodOption.key}
-            className={`mood-pill${mood === moodOption.key ? " active" : ""}`}
-            onClick={() => setMood(moodOption.key)}
+      <div className="mt-4 grid gap-4 lg:grid-cols-[minmax(0,1.3fr)_minmax(0,0.8fr)]">
+        <div className="panel-glow mac-glass rounded-[26px] p-4">
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              onSearch();
+            }}
+            className="flex flex-col gap-3 md:flex-row"
           >
-            {moodOption.emoji} {moodOption.label}
-          </button>
-        ))}
+            <div className="flex-1">
+              <input
+                id="news-search"
+                list="hypernews-search-suggestions"
+                name="newsSearch"
+                type="text"
+                placeholder="Trace a topic, source, or mood..."
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                className="mac-glass w-full rounded-[20px] px-4 py-3 text-sm text-[var(--foreground)] outline-none transition placeholder:text-white/30 focus:border-[var(--border-strong)]"
+              />
+              <datalist id="hypernews-search-suggestions">
+                {suggestions.map((suggestion) => (
+                  <option key={suggestion} value={suggestion} />
+                ))}
+              </datalist>
+            </div>
+            <div className="flex gap-2 md:self-end">
+              <Button type="submit" disabled={loading} className="px-5 py-2 text-xs">
+                {loading && surface === "search" ? "Searching..." : "Search"}
+              </Button>
+              <Button
+                variant="secondary"
+                type="button"
+                onClick={onRefresh}
+                disabled={loading}
+                className="px-5 py-2 text-xs"
+              >
+                {loading && surface === "feed" ? "Loading..." : "Refresh"}
+              </Button>
+            </div>
+          </form>
+          {suggestions.length > 0 && (
+            <div className="mt-3 flex flex-wrap gap-2">
+              {suggestions.slice(0, 6).map((item) => (
+                <button
+                  key={item}
+                  type="button"
+                  onClick={() => {
+                    setQuery(item);
+                    onSearch();
+                  }}
+                  className="rounded-full border border-white/14 bg-white/[0.14] px-3 py-2 text-xs text-[var(--muted)] backdrop-blur-2xl transition hover:bg-white/[0.2]"
+                >
+                  {item}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="grid gap-4 md:grid-cols-[minmax(0,1fr)_minmax(200px,0.8fr)] lg:grid-cols-1 xl:grid-cols-[minmax(0,1fr)_minmax(200px,0.8fr)]">
+          <div className="panel-glow mac-glass rounded-[26px] p-4">
+            <p className="mb-3 text-sm text-[var(--muted-strong)]">Mood</p>
+            <div className="flex flex-wrap gap-2">
+              {moods.map((entry) => (
+                <Pill key={entry.key} active={mood === entry.key} onClick={() => setMood(entry.key)}>
+                  {entry.emoji} {entry.label}
+                </Pill>
+              ))}
+              <button
+                onClick={setAffectEnabled}
+                className={cx(
+                  "inline-flex items-center rounded-full border px-3 py-1.5 text-xs font-medium tracking-[0.12em] uppercase backdrop-blur-xl transition",
+                  affectEnabled
+                    ? "border-[rgba(122,215,168,0.3)] bg-[linear-gradient(180deg,rgba(122,215,168,0.2),rgba(122,215,168,0.08))] text-[var(--success)]"
+                    : "border-white/12 bg-[linear-gradient(180deg,rgba(255,255,255,0.12),rgba(255,255,255,0.05))] text-[var(--muted-strong)]",
+                )}
+              >
+                {affectEnabled ? "Camera On" : "Auto Mood"}
+              </button>
+              {affectSensor}
+            </div>
+          </div>
+
+          <RangeSlider label="Explore / Focus" value={exploreFocus} onChange={setExploreFocus} />
+        </div>
       </div>
     </header>
   );

@@ -32,8 +32,10 @@ except Exception:
 _mem_store: dict = {}   # {key: (value, expires_at)}
 
 _RECENT_HISTORY_TTL = 3600          # 1 hour for recent-click sorted set
-_RECENT_HISTORY_MAX = 50            # max items kept in Redis sorted set
+_RECENT_HISTORY_MAX = 100           # keep more raw history while recent state trims to 25
 _SESSION_TTL        = 3600
+_RECENT_STATE_LIMIT = 25
+_RECENT_QUERY_LIMIT = 10
 
 
 def _redis_set(key: str, value: str, ttl: int = _SESSION_TTL):
@@ -91,7 +93,7 @@ def push_recent_history(user_id: str, article_id: str, score: float = 1.0):
         _mem_store[key] = (json.dumps(lst), time.time() + _RECENT_HISTORY_TTL)
 
 
-def get_recent_history(user_id: str, limit: int = 20) -> list[str]:
+def get_recent_history(user_id: str, limit: int = _RECENT_STATE_LIMIT) -> list[str]:
     """Return the most-recent `limit` article IDs from the hot Redis layer."""
     key = _history_key(user_id)
     if _REDIS_OK:
@@ -112,6 +114,8 @@ def clear_recent_history(user_id: str):
 @dataclass
 class UserProfile:
     user_id:         str
+    display_name:    str              = ""
+    email:           str              = ""
     interests:       Dict[str, float] = field(default_factory=dict)
     reading_history: List[str]        = field(default_factory=list)
     avg_dwell_time:  float            = 0.0
@@ -119,7 +123,24 @@ class UserProfile:
     time_of_day:     str              = "morning"
     recent_clicks:   List[str]        = field(default_factory=list)
     recent_skips:    List[str]        = field(default_factory=list)
+    recent_negative_actions: List[str] = field(default_factory=list)
     session_topics:  List[str]        = field(default_factory=list)
+    recent_queries:  List[str]        = field(default_factory=list)
+    recent_entities: List[str]        = field(default_factory=list)
+    recent_sources:  List[str]        = field(default_factory=list)
+    age_bucket:      str              = ""
+    gender:          str              = ""
+    occupation:      str              = ""
+    location_region: str              = ""
+    location_country: str             = ""
+    interest_text:   str              = ""
+    top_categories:  List[str]        = field(default_factory=list)
+    affect_consent:  bool             = False
+    bio_embedding:   List[float]      = field(default_factory=list)
+    bio_text_embedding: List[float]   = field(default_factory=list)
+    bio_embedding_version: str        = ""
+    onboarding_completed: bool        = False
+    onboarding_completed_at: str      = ""
 
     # how many positive interactions has this user had total?
     # used to gate cold-start vs RL mode
@@ -131,6 +152,60 @@ class UserProfile:
     # ephemeral: last candidate pool served to this user (for category reward propagation)
     # not persisted to Redis or SQLite
     _last_candidate_pool: list        = field(default_factory=list, repr=False)
+
+
+def _trim_recent(values: List[str], limit: int) -> List[str]:
+    cleaned = [str(value).strip() for value in values if str(value).strip()]
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[-limit:]
+
+
+def append_recent(values: List[str], item: str, limit: int = _RECENT_STATE_LIMIT, dedupe: bool = False) -> List[str]:
+    normalized = str(item or "").strip()
+    if not normalized:
+        return _trim_recent(values, limit)
+    if dedupe:
+        values = [value for value in values if str(value).strip() != normalized]
+    values.append(normalized)
+    return _trim_recent(values, limit)
+
+
+def extend_recent(values: List[str], items: List[str], limit: int = _RECENT_STATE_LIMIT, dedupe: bool = True) -> List[str]:
+    current = list(values)
+    for item in items:
+        current = append_recent(current, item, limit=limit, dedupe=dedupe)
+    return current
+
+
+def update_user_state(
+    user: UserProfile,
+    *,
+    query: str | None = None,
+    entities: list[str] | None = None,
+    source: str | None = None,
+    article_id: str | None = None,
+    category: str | None = None,
+    negative: bool = False,
+):
+    if query:
+        user.recent_queries = append_recent(user.recent_queries, query, limit=_RECENT_QUERY_LIMIT)
+    if entities:
+        user.recent_entities = extend_recent(user.recent_entities, list(entities), limit=_RECENT_STATE_LIMIT)
+    if source:
+        user.recent_sources = append_recent(user.recent_sources, source, limit=_RECENT_STATE_LIMIT, dedupe=True)
+    if article_id:
+        if negative:
+            user.recent_negative_actions = append_recent(
+                user.recent_negative_actions,
+                article_id,
+                limit=_RECENT_STATE_LIMIT,
+                dedupe=True,
+            )
+        else:
+            user.recent_clicks = append_recent(user.recent_clicks, article_id, limit=_RECENT_STATE_LIMIT, dedupe=True)
+    if category:
+        user.session_topics = append_recent(user.session_topics, category, limit=_RECENT_STATE_LIMIT)
 
 
 # ── Context helpers ───────────────────────────────────────────────────────────
@@ -171,10 +246,15 @@ def update_user_session(user: UserProfile):
     """Persist short-term session data to Redis (or memory fallback) for 1 hour."""
     key = f"session:{user.user_id}"
     data = {
-        "recent_clicks":               user.recent_clicks[-20:],
-        "recent_skips":                user.recent_skips[-30:],
-        "session_topics":              user.session_topics[-20:],
+        "recent_clicks":               user.recent_clicks[-_RECENT_STATE_LIMIT:],
+        "recent_skips":                user.recent_skips[-_RECENT_STATE_LIMIT:],
+        "recent_negative_actions":     user.recent_negative_actions[-_RECENT_STATE_LIMIT:],
+        "session_topics":              user.session_topics[-_RECENT_STATE_LIMIT:],
+        "recent_queries":              user.recent_queries[-_RECENT_QUERY_LIMIT:],
+        "recent_entities":             user.recent_entities[-_RECENT_STATE_LIMIT:],
+        "recent_sources":              user.recent_sources[-_RECENT_STATE_LIMIT:],
         "mood":                        user.mood,
+        "avg_dwell_time":              float(user.avg_dwell_time or 0.0),
         "total_positive_interactions": user.total_positive_interactions,
         "interest_update_count":       user.interest_update_count,
     }

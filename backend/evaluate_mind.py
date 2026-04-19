@@ -16,16 +16,16 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import sys
 import tempfile
 from collections import Counter
-from datetime import datetime
+from datetime import UTC, datetime
 
 import networkx as nx
 import numpy as np
 import pandas as pd
-from sentence_transformers import SentenceTransformer
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -34,11 +34,13 @@ _BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 if _BASE not in sys.path:
     sys.path.insert(0, _BASE)
 
-from backend.bandit import LinUCBBandit
 from backend.graph import build_knowledge_graph, get_related_articles
 from backend.mind_data import BEHAVIOR_COLUMNS, load_mind_news
 from backend.ranker import build_context_vector, rank_articles
 from backend.user_profile import UserProfile, compute_context_score
+
+_PREPARED_PARQUET = os.path.join(_BASE, "data", "articles.parquet")
+_PREPARED_EMBEDDINGS = os.path.join(_BASE, "data", "article_embeddings.npy")
 
 
 def parse_args() -> argparse.Namespace:
@@ -61,6 +63,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--limit-impressions", type=int, default=1000)
     parser.add_argument("--model-name", default="all-MiniLM-L6-v2")
+    parser.add_argument("--output-json", default="")
+    parser.add_argument("--label", default="")
+    parser.add_argument("--compare-json", default="")
     return parser.parse_args()
 
 
@@ -102,6 +107,40 @@ def _required_news_ids(behaviors: pd.DataFrame) -> set[str]:
     return news_ids
 
 
+def _load_prepared_eval_assets(required_ids: set[str]) -> tuple[pd.DataFrame | None, np.ndarray | None]:
+    """Use the repo's processed article table and embedding matrix when possible.
+
+    This avoids raw MIND reload + on-the-fly embedding generation on low-memory
+    machines while still evaluating on the same dev-impression slice.
+    """
+    if not required_ids:
+        return None, None
+    if not os.path.exists(_PREPARED_PARQUET) or not os.path.exists(_PREPARED_EMBEDDINGS):
+        return None, None
+
+    full_df = pd.read_parquet(_PREPARED_PARQUET).reset_index(drop=True)
+    if "news_id" not in full_df.columns:
+        return None, None
+
+    full_df["news_id"] = full_df["news_id"].astype(str)
+    mask = full_df["news_id"].isin(required_ids).to_numpy()
+    matched = int(mask.sum())
+    if matched == 0:
+        return None, None
+
+    coverage = matched / max(len(required_ids), 1)
+    if coverage < 0.98:
+        return None, None
+
+    embeddings = np.load(_PREPARED_EMBEDDINGS, mmap_mode="r")
+    if len(embeddings) != len(full_df):
+        return None, None
+
+    eval_df = full_df.loc[mask].reset_index(drop=True)
+    eval_embeddings = np.asarray(embeddings[mask], dtype="float32")
+    return eval_df, eval_embeddings
+
+
 def _embedding_cache_path(news_ids: list[str], model_name: str) -> str:
     os.makedirs(os.path.join(_BASE, "data", "eval_cache"), exist_ok=True)
     digest = hashlib.sha1(("|".join(news_ids) + "|" + model_name).encode("utf-8")).hexdigest()[:12]
@@ -115,6 +154,8 @@ def _compute_embeddings(df: pd.DataFrame, model_name: str) -> np.ndarray:
         embeddings = np.load(cache_path)
         if len(embeddings) == len(df):
             return embeddings.astype("float32")
+
+    from sentence_transformers import SentenceTransformer
 
     model = SentenceTransformer(model_name)
     embeddings = model.encode(
@@ -353,6 +394,66 @@ def _improved_ranker(user: UserProfile, candidate_articles: list[dict], df: pd.D
     return rank_articles(user, candidate_articles, embeddings, None, df, graph)
 
 
+def _offline_memory_bonus_map(
+    user: UserProfile,
+    candidate_articles: list[dict],
+    df: pd.DataFrame,
+    embeddings: np.ndarray,
+    graph,
+) -> dict[str, float]:
+    news_id_to_idx = pd.Series(df.index, index=df["news_id"]).to_dict()
+    candidate_ids = [article["news_id"] for article in candidate_articles if article.get("news_id") in news_id_to_idx]
+    if not candidate_ids or not user.reading_history:
+        return {}
+
+    scores: Counter = Counter()
+    recent_history = [news_id for news_id in user.reading_history[-12:] if news_id in news_id_to_idx]
+    if not recent_history:
+        return {}
+
+    for hist_rank, history_id in enumerate(reversed(recent_history)):
+        hist_embedding = _l2_normalize(embeddings[news_id_to_idx[history_id]])
+        hist_weight = 1.0 / (1.0 + (hist_rank * 0.25))
+        graph_related = set(get_related_articles(history_id, graph, limit=120)) if graph is not None else set()
+
+        for candidate_id in candidate_ids:
+            if candidate_id == history_id:
+                continue
+            candidate_embedding = _l2_normalize(embeddings[news_id_to_idx[candidate_id]])
+            semantic_score = float(np.clip((np.dot(hist_embedding, candidate_embedding) + 1.0) / 2.0, 0.0, 1.0))
+            if semantic_score > 0.55:
+                scores[candidate_id] += hist_weight * semantic_score
+            if candidate_id in graph_related:
+                scores[candidate_id] += 0.30 * hist_weight
+
+    if not scores:
+        return {}
+
+    max_score = max(scores.values())
+    if max_score <= 0:
+        return {}
+    return {news_id: float(score / max_score) for news_id, score in scores.items()}
+
+
+def _hybrid_memory_ranker(
+    user: UserProfile,
+    candidate_articles: list[dict],
+    df: pd.DataFrame,
+    embeddings: np.ndarray,
+    graph,
+) -> list[dict]:
+    memory_bonus_map = _offline_memory_bonus_map(user, candidate_articles, df, embeddings, graph)
+    return rank_articles(
+        user,
+        candidate_articles,
+        embeddings,
+        None,
+        df,
+        graph,
+        memory_bonus_map=memory_bonus_map,
+    )
+
+
 def _evaluate_neural_bandit_variant(
     name: str,
     behaviors: pd.DataFrame,
@@ -360,10 +461,13 @@ def _evaluate_neural_bandit_variant(
     embeddings: np.ndarray,
     graph,
 ) -> dict[str, float]:
+    from backend.bandit import LinUCBBandit
+
     news_lookup = {row["news_id"]: row for row in df.to_dict("records")}
     news_id_to_idx = pd.Series(df.index, index=df["news_id"]).to_dict()
     metrics = {"auc": [], "mrr": [], "ndcg5": [], "ndcg10": []}
-    bandit = LinUCBBandit(context_dim=embeddings.shape[1] + 3, alpha=0.25)
+    context_dim = int(build_context_vector(UserProfile(user_id="eval"), embeddings[0]).shape[0])
+    bandit = LinUCBBandit(context_dim=context_dim, alpha=0.25)
 
     for row in behaviors.itertuples(index=False):
         user = _build_user(row, news_lookup)
@@ -419,22 +523,50 @@ def _evaluate_neural_bandit_variant(
     }
 
 
+def _print_comparison(current_results: list[dict], compare_path: str) -> None:
+    if not compare_path or not os.path.exists(compare_path):
+        return
+
+    with open(compare_path, "r", encoding="utf-8") as handle:
+        previous_payload = json.load(handle)
+
+    previous_results = {
+        result["variant"]: result
+        for result in previous_payload.get("results", [])
+    }
+    print(f"\nComparison vs {compare_path}")
+    for result in current_results:
+        previous = previous_results.get(result["variant"])
+        if not previous:
+            continue
+        print(result["variant"])
+        print(f"  AUC:     {result['auc'] - float(previous.get('auc', 0.0)):+.4f}")
+        print(f"  MRR:     {result['mrr'] - float(previous.get('mrr', 0.0)):+.4f}")
+        print(f"  nDCG@5:  {result['ndcg5'] - float(previous.get('ndcg5', 0.0)):+.4f}")
+        print(f"  nDCG@10: {result['ndcg10'] - float(previous.get('ndcg10', 0.0)):+.4f}")
+
+
 def main():
     args = parse_args()
     if not os.path.exists(args.train_news) or not os.path.exists(args.train_behaviors) or not os.path.exists(args.dev_news) or not os.path.exists(args.dev_behaviors):
         raise FileNotFoundError("MIND train/dev files are required. Run the raw data download step first.")
 
-    print("Loading MIND train/dev data...")
-    full_df = load_mind_news(
-        [args.train_news, args.dev_news],
-        behavior_paths=[args.train_behaviors],
-    )
     dev_behaviors = _load_behaviors(args.dev_behaviors, args.limit_impressions)
     required_ids = _required_news_ids(dev_behaviors)
-    eval_df = full_df[full_df["news_id"].isin(required_ids)].reset_index(drop=True)
-    print(f"Evaluation sample: {len(dev_behaviors):,} impressions | {len(eval_df):,} unique articles")
+    eval_df, embeddings = _load_prepared_eval_assets(required_ids)
 
-    embeddings = _compute_embeddings(eval_df, args.model_name)
+    if eval_df is not None and embeddings is not None:
+        print("Loading evaluation data from prepared article assets...")
+    else:
+        print("Loading MIND train/dev data...")
+        full_df = load_mind_news(
+            [args.train_news, args.dev_news],
+            behavior_paths=[args.train_behaviors],
+        )
+        eval_df = full_df[full_df["news_id"].isin(required_ids)].reset_index(drop=True)
+        embeddings = _compute_embeddings(eval_df, args.model_name)
+
+    print(f"Evaluation sample: {len(dev_behaviors):,} impressions | {len(eval_df):,} unique articles")
 
     naive_df = eval_df.copy()
     naive_df["entities"] = [[] for _ in range(len(naive_df))]
@@ -454,9 +586,19 @@ def main():
             embeddings,
             structured_graph,
         )
+        hybrid_memory = _evaluate_variant(
+            "improved_structured_graph_hybrid_memory",
+            dev_behaviors,
+            eval_df,
+            embeddings,
+            structured_graph,
+            _hybrid_memory_ranker,
+        )
+
+    results = [baseline, improved, neural_bandit, hybrid_memory]
 
     print("\nResults")
-    for result in (baseline, improved, neural_bandit):
+    for result in results:
         print(
             f"{result['variant']}: impressions={result['impressions']:,} | "
             f"AUC={result['auc']:.4f} | MRR={result['mrr']:.4f} | "
@@ -474,6 +616,27 @@ def main():
     print(f"MRR:     {neural_bandit['mrr'] - improved['mrr']:+.4f}")
     print(f"nDCG@5:  {neural_bandit['ndcg5'] - improved['ndcg5']:+.4f}")
     print(f"nDCG@10: {neural_bandit['ndcg10'] - improved['ndcg10']:+.4f}")
+
+    print("\nDelta (hybrid memory - structured graph)")
+    print(f"AUC:     {hybrid_memory['auc'] - improved['auc']:+.4f}")
+    print(f"MRR:     {hybrid_memory['mrr'] - improved['mrr']:+.4f}")
+    print(f"nDCG@5:  {hybrid_memory['ndcg5'] - improved['ndcg5']:+.4f}")
+    print(f"nDCG@10: {hybrid_memory['ndcg10'] - improved['ndcg10']:+.4f}")
+
+    payload = {
+        "label": args.label or "",
+        "timestamp": datetime.now(UTC).isoformat(),
+        "limit_impressions": args.limit_impressions,
+        "model_name": args.model_name,
+        "results": results,
+    }
+
+    if args.output_json:
+        with open(args.output_json, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+        print(f"\nSaved metrics JSON to {args.output_json}")
+
+    _print_comparison(results, args.compare_json)
 
 
 if __name__ == "__main__":
