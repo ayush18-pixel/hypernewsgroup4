@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from "recharts";
+import type { NameType, ValueType } from "recharts/types/component/DefaultTooltipContent";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -13,6 +14,16 @@ const CATEGORY_COLORS: Record<string, string> = {
 
 interface Props {
   userId: string;
+}
+
+function formatInterestValue(value: ValueType, _name: NameType): [string, string] {
+  const rawValue = Array.isArray(value) ? value[0] : value;
+  const numericValue =
+    typeof rawValue === "number" && Number.isFinite(rawValue)
+      ? rawValue
+      : Number(rawValue ?? 0);
+  const safeValue = Number.isFinite(numericValue) ? numericValue : 0;
+  return [`${safeValue.toFixed(2)} pts`, "Interest Score"];
 }
 
 export default function InterestChart({ userId }: Props) {
@@ -54,7 +65,7 @@ export default function InterestChart({ userId }: Props) {
           <Tooltip
             contentStyle={{ background: "rgba(10,14,26,0.95)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 8, fontSize: 12 }}
             labelStyle={{ color: "#f1f5f9" }}
-            formatter={(v: number) => [`${v.toFixed(2)} pts`, "Interest Score"]}
+            formatter={formatInterestValue}
           />
           <Bar dataKey="value" radius={[0, 6, 6, 0]}>
             {data.map(entry => (
